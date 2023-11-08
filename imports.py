@@ -5,12 +5,12 @@ import sys
 import time
 
 from io import SEEK_SET
-from typing import List, Dict, BinaryIO, Any, TextIO, Union
+from typing import List, Dict, BinaryIO, Any, TextIO, Union, Optional
 
 from unicorn import Uc, UC_QUERY_ARCH, UC_MODE_64, UC_QUERY_MODE, UC_MEM_READ, UC_PROT_NONE, UC_PROT_READ, UC_PROT_EXEC, \
     UC_PROT_WRITE
 from unicorn.x86_const import UC_X86_REG_RCX, UC_X86_REG_RAX, UC_X86_REG_RSP, UC_X86_REG_RDX, UC_X86_REG_R8D, \
-    UC_X86_REG_R8, UC_X86_REG_R9
+    UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_RIP
 
 from exc import Exited
 from utils import pack_int64, read_int32, pack_int32, read_int64, pack_int16, read_int16, pack_int8, read_uint64, \
@@ -54,6 +54,46 @@ def read_stack_param(u: Uc, index: int):
         return read_uint64(u.mem_read(u.reg_read(UC_X86_REG_RSP) + 0x28 + 8 * index, 8))
     else:
         return read_uint32(u.mem_read(u.reg_read(UC_X86_REG_RSP) + 0x14 + 4 * index, 4))
+
+def alloc_memory(alloc_list: list[tuple[int, int]], size: int) -> Optional[int]:
+    if size % 4096 != 0:
+        size = (size // 4096 + 1) * 4096
+    for block in alloc_list:
+        if block[1] >= size:
+            res = block[0]
+            alloc_list.append((block[0] + size, block[1] - size))
+            alloc_list.remove(block)
+            alloc_list.sort(key=lambda b: b[0])
+            return res
+    return None
+
+def enlarge_memory(alloc_list: list[tuple[int, int]], size):
+    blocks = size // 0x100000 + 1
+    last_block = alloc_list[-1]
+    last_address = last_block[0] + last_block[1]
+    alloc_list.remove(last_block)
+    alloc_list.append((last_block[0], last_block[1] + 0x100000 * blocks))
+
+def dealloc_memory(alloc_list: list[tuple[int, int]], start: int, size: int):
+    if start % 4096 != 0:
+        start = (start // 4096) * 4096
+    if size % 4096 != 0:
+        size = (size // 4096 + 1) * 4096
+    alloc_list.append((start, size))
+    alloc_list.sort(key=lambda b: b[0])
+    last = (0, 0)
+    d = []
+    for block in alloc_list:
+        if last[0] + last[1] == block[0]:
+            d.append(last)
+            d.append(block)
+            alloc_list.append((last[0], last[1] + block[1]))
+            last = (last[0], last[1] + block[1])
+        else:
+            last = block
+    alloc_list.sort(key=lambda b: b[0])
+    for block in d:
+        alloc_list.remove(block)
 
 def GetSystemTimeAsFileTime(machine):
     # void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
@@ -138,14 +178,19 @@ def GetModuleHandleA(u: Uc):
     else:
         size = u.reg_read(UC_X86_REG_RAX)
         buf = u.mem_read(lpModuleName, size)
-        # if buf.decode().lower() == "ntdll.dll":
-        #     handle = 0x40000000
-        #     try:
-        #         machine.memory.map_file(open("ntdll.dll", "rb"), 0, 0x400, 0x40000000, 0x400, "ntdll.dll")
-        #     except MemoryError:
-        #         pass
-        # else:
-        handle = read_int32(buf[:4])
+        if buf.decode().lower() == "ntdll.dll":
+            handle = 0x40000000
+            do_map = True
+            for mem in u.mem_regions():
+                if mem[0] <= 0x40000000 <= mem[1]:
+                    do_map = False
+                    break
+            if do_map:
+                data = open("ntdll.dll", "rb").read()
+                u.mem_map(0x40000000, 0x1000)
+                u.mem_write(0x40000000, data)
+        else:
+            handle = read_int32(buf[:4])
     u.reg_write(UC_X86_REG_RAX, handle)
     log(u, "GetModuleHandleA(\"%s\") => %#x" % (buf.decode(), handle))
     error(0)
@@ -306,22 +351,24 @@ def GetModuleFileNameA(u: Uc):
     ))
     error(err)
 
-def CreateFileW(u: Uc):
-    # HANDLE CreateFileW( LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
-    # LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
-    # HANDLE hTemplateFile );
+def CreateFile(u: Uc, a: bool):
+    function_name = "CreateFileA" if a else "CreateFileW"
     lpFileName = u.reg_read(UC_X86_REG_RCX)
     dwDesiredAccess = u.reg_read(UC_X86_REG_RDX)
     dwShareMode = u.reg_read(UC_X86_REG_R8)
     lpSecurityAttributes = u.reg_read(UC_X86_REG_R9)
-    rsp = u.reg_read(UC_X86_REG_RSP)
-    dwCreationDisposition = read_int64(u.mem_read(rsp + 0x28, 8))
-    dwFlagsAndAttributes = read_int64(u.mem_read(rsp + 0x30, 8))
-    hTemplateFile = read_int64(u.mem_read(rsp + 0x38, 8))
-    wcslen(u)
+    dwCreationDisposition = read_stack_param(u, 0)
+    dwFlagsAndAttributes = read_stack_param(u, 1)
+    hTemplateFile = read_stack_param(u, 2)
+    if a:
+        strlen(u)
+    else:
+        wcslen(u)
     size = u.reg_read(UC_X86_REG_RAX)
-    filename = u.mem_read(lpFileName, size * 2).decode("utf-16le")
-    # filename_converted = filename.replace("\\", "/")
+    if a:
+        filename = u.mem_read(lpFileName, size).decode()
+    else:
+        filename = u.mem_read(lpFileName, size * 2).decode("utf-16le")
     if dwFlagsAndAttributes & 0x2000000:
         # try dir
         if os.path.exists(filename):
@@ -329,78 +376,81 @@ def CreateFileW(u: Uc):
             handle = next_dir_handle + 0x40000
             dir_handles[next_dir_handle] = filename
             next_dir_handle += 1
-            log(u, "CreateFileW dir %s" % filename)
             u.reg_write(UC_X86_REG_RAX, handle)
             return
     global next_file_handle
     handle = next_file_handle + 0x10000
-    mode = ""
-    if dwDesiredAccess & 0x40000000 == 0x40000000:
-        mode = "wb"
-    if dwDesiredAccess & 0x80000000 == 0x80000000:
-        mode = "rb"
-    if dwDesiredAccess & 0xC0000000 == 0xC0000000:
-        mode = "rb+"
-    try:
-        file = open(filename, mode)
-        file_handles[next_file_handle] = file
-        next_file_handle += 1
-        u.reg_write(UC_X86_REG_RAX, handle)
-        error(0)
-    except:
-        u.reg_write(UC_X86_REG_RAX, -1)
-        error(2)
-    log(u, "CreateFileW(\"%s\", %#x, %#x, %#x, %#x, %#x, %#x) => %#x" % (
-        filename, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
-        dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile, u.reg_read(UC_X86_REG_RAX)
-    ))
 
-def CreateFileA(machine):
-    # HANDLE CreateFileA( LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile );
-    lpFileName = machine.cpu.state.rcx
-    dwDesiredAccess = machine.cpu.state.rdx
-    dwShareMode = machine.cpu.state.r8
-    lpSecurityAttributes = machine.cpu.state.r9
-    dwCreationDisposition = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
-    dwFlagsAndAttributes = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x30, 8))
-    hTemplateFile = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x38, 8))
-    strlen(machine)
-    size = machine.cpu.state.rax.value
-    filename = machine.memory.read(lpFileName, size).decode()
-    filename_converted = filename.replace("\\", "/")
-    if dwFlagsAndAttributes & 0x2000000:
-        # try dir
-        if os.path.exists(filename_converted):
-            global next_dir_handle
-            handle = next_dir_handle + 0x40000
-            dir_handles[next_dir_handle] = filename_converted
-            next_dir_handle += 1
-            log(machine, "CreateFileW dir %s" % filename)
-            machine.cpu.state.rax.value = handle
-            return
-    global next_file_handle
-    handle = next_file_handle + 0x10000
-    log(machine, "CreateFileA %s access %s" % (filename, dwDesiredAccess))
+    if "\\\\.\\" in filename:
+        fs_filename = filename.replace("\\\\.\\", "c:\\temp\\")
+    else:
+        fs_filename = filename
     mode = ""
-    if dwDesiredAccess.value & 0x40000000 == 0x40000000:
+    write = False
+    failed = False
+    exist = False
+    err = 0
+    if dwDesiredAccess & 0x40000000:
+        write = True
+    if os.path.exists(filename):
+        exist = True
+    if dwCreationDisposition == 1:
+        if exist:
+            err = 80
+            failed = True
+        else:
+            mode = "wb" if write else "rb"
+    elif dwCreationDisposition == 2:
         mode = "wb"
-    if dwDesiredAccess.value & 0x80000000 == 0x80000000:
-        mode = "rb"
-    if dwDesiredAccess.value & 0xC0000000 == 0xC0000000:
-        mode = "rb+"
-    try:
-        file = open(filename, mode)
-        file_handles[next_file_handle] = file
-        next_file_handle += 1
-        machine.cpu.state.rax.value = handle
-        error(0)
-    except:
-        machine.cpu.state.rax.value = -1
-        error(2)
-    log(machine, "CreateFileA(\"%s\", %#x, %#x, %#x, %#x, %#x, %#x) => %#x" % (
-        filename, dwDesiredAccess.value, dwShareMode.value, lpSecurityAttributes.value,
-        dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile, machine.cpu.state.rax.value
-    ))
+        if exist:
+            err = 183
+    elif dwCreationDisposition == 3:
+        if "\\\\.\\" in filename:
+            mode = "ab+"
+        else:
+            mode = "rb+" if write else "rb"
+            if not exist:
+                err = 2
+                failed = True
+    elif dwCreationDisposition == 4:
+        mode = "rb+" if write else "rb"
+        if not exist:
+            err = 183
+    elif dwCreationDisposition == 5:
+        if not exist:
+            err = 2
+            failed = True
+        else:
+            mode = "wb"
+
+    if not failed:
+        try:
+            file = open(fs_filename, mode)
+            file_handles[next_file_handle] = file
+            next_file_handle += 1
+            u.reg_write(UC_X86_REG_RAX, handle)
+            err = 0
+        except:
+            u.reg_write(UC_X86_REG_RAX, -1)
+            err = 2
+    else:
+        u.reg_write(UC_X86_REG_RAX, -1)
+    log(u, f"{function_name}(\"{filename}\", {dwDesiredAccess:#x}, {dwShareMode}, "
+    f"{lpSecurityAttributes}, {dwCreationDisposition}, {dwFlagsAndAttributes}, "
+    f"{hTemplateFile}) => {u.reg_read(UC_X86_REG_RAX):#x}")
+    error(err)
+
+def CreateFileW(u: Uc):
+    # HANDLE CreateFileW( LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    # LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
+    # HANDLE hTemplateFile );
+    return CreateFile(u, False)
+
+def CreateFileA(u: Uc):
+    # HANDLE CreateFileA( LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    # LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
+    # HANDLE hTemplateFile );
+    return CreateFile(u, True)
 
 def CreateFileMappingA(u: Uc):
     # HANDLE CreateFileMappingA( HANDLE hFile, LPSECURITY_ATTRIBUTES lpFileMappingAttributes, DWORD flProtect,
@@ -535,13 +585,17 @@ def MapViewOfFile(u: Uc):
     else:
         data = bytearray([0]) * (file_mappings[handle] & 0xffffffff)
         name = "Pagefile %#x" % handle
-    res = (0, 0)
+
+    if dwNumberOfBytesToMap == 0:
+        size = len(data)
+    else:
+        size = dwNumberOfBytesToMap
+    if size % 4096 != 0:
+        size = (size // 4096 + 1) * 4096
+
     free_map: list[tuple[int, int]] = u.__getattribute__("free_map")
-    for start, size in free_map:
-        if size >= len(data):
-            res = (start, size)
-            break
-    if res[0] == 0:
+    res = alloc_memory(free_map, size)
+    if res is None:
         u.reg_write(UC_X86_REG_RAX, 0)
         log(u, "MapViewOfFile(%#x(%#x, \"%s\"), %#x, %#x, %#x, %d) => %#x" % (
             hFileMappingObject, file_mappings[handle], name, dwDesiredAccess, dwFileOffsetHigh,
@@ -549,22 +603,13 @@ def MapViewOfFile(u: Uc):
         ))
         error(8)
         return
-    if dwNumberOfBytesToMap == 0:
-        size = len(data)
-        if size % 4096 != 0:
-            size = (size // 4096 + 1) * 4096
-    else:
-        size = dwNumberOfBytesToMap
-    free_map.remove(res)
-    free_map.append((res[0] + size, res[1] - size))
-    free_map.sort(key=lambda b: b[0])
-    u.mem_map(res[0], size)
-    u.mem_write(res[0], data)
+    u.mem_map(res, size)
+    u.mem_write(res, data)
 
-    u.reg_write(UC_X86_REG_RAX, res[0])
+    u.reg_write(UC_X86_REG_RAX, res)
     log(u, "MapViewOfFile(%#x(%#x, \"%s\"), %#x, %#x, %#x, %d) => %#x" % (
         hFileMappingObject, file_mappings[handle], name, dwDesiredAccess, dwFileOffsetHigh,
-        dwFileOffsetLow, dwNumberOfBytesToMap, res[0]
+        dwFileOffsetLow, dwNumberOfBytesToMap, res
     ))
     error(0)
 
@@ -575,23 +620,9 @@ def UnmapViewOfFile(u: Uc):
         for start, end, _ in u.mem_regions():
             size = end - start + 1
             if start == lpBaseAddress:
-                free_map = u.__getattribute__("free_map")
                 u.mem_unmap(start, size)
-                free_map.append((start, size))
-                free_map.sort(key=lambda b: b[0])
-                last = (0, 0)
-                d = []
-                for block in free_map:
-                    if last[0] + last[1] == block[0]:
-                        d.append(last)
-                        d.append(block)
-                        free_map.append((last[0], last[1] + block[1]))
-                        last = (last[0], last[1] + block[1])
-                    else:
-                        last = block
-                free_map.sort(key=lambda b: b[0])
-                for block in d:
-                    free_map.remove(block)
+                free_map = u.__getattribute__("free_map")
+                dealloc_memory(free_map, start, size)
                 u.reg_write(UC_X86_REG_RAX, 1)
                 log(u, "UnmapViewOfFile(%#x) => %d" % (lpBaseAddress, u.reg_read(UC_X86_REG_RAX)))
                 error(0)
@@ -682,10 +713,10 @@ def UnhandledExceptionFilter(machine):
     log(machine, "UnhandledExceptionFilter(%#x) => %d" % (ExceptionInfo, machine.cpu.state.rax.value))
     raise NotImplementedError
 
-def IsDebuggerPresent(machine):
+def IsDebuggerPresent(u: Uc):
     # BOOL IsDebuggerPresent();
-    machine.cpu.state.rax.value = 0
-    log(machine, "IsDebuggerPresent() => %d" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "IsDebuggerPresent() => %d" % 0)
 
 def GetLocalTime(u: Uc):
     # void GetLocalTime( LPSYSTEMTIME lpSystemTime );
@@ -924,17 +955,11 @@ def VirtualAlloc(u: Uc):
         raise NotImplementedError
     if lpAddress == 0:
         free_alloc = u.__getattribute__("free_alloc")
-        res = 0
-        size = dwSize
-        if size % 4096 != 0:
-            size = (size // 4096 + 1) * 4096
-        for block in free_alloc:
-            if block[1] >= size:
-                res = block[0]
-                free_alloc.append((block[0] + size, block[1] - size))
-                free_alloc.remove(block)
-                free_alloc.sort(key=lambda b: b[0])
-                break
+        res = alloc_memory(free_alloc, dwSize)
+        if res is None:
+            # add more to the heap
+            enlarge_memory(free_alloc, dwSize)
+            res = alloc_memory(free_alloc, dwSize)
     else:
         raise NotImplementedError
     u.reg_write(UC_X86_REG_RAX, res)
@@ -946,28 +971,42 @@ def VirtualAlloc(u: Uc):
     else:
         error(0)
 
-def VirtualFree(machine):
+def VirtualFree(u: Uc):
     # BOOL VirtualFree( LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType );
-    lpAddress = machine.cpu.state.rcx
-    dwSize = machine.cpu.state.rdx
-    dwFreeType = machine.cpu.state.r8
+    lpAddress = u.reg_read(UC_X86_REG_RCX)
+    dwSize = u.reg_read(UC_X86_REG_RDX)
+    dwFreeType = u.reg_read(UC_X86_REG_R8)
     if dwFreeType != 0x00008000:
         raise NotImplementedError
-    machine.memory.free(lpAddress.value)
-    machine.cpu.state.rax.value = 1
-    log(machine, "VirtualFree(%#x, %d, %#x) => %d" % (
-        lpAddress.value, dwSize.value, dwFreeType.value, machine.cpu.state.rax.value
-    ))
-    error(0)
+    free_alloc = u.__getattribute__("free_alloc")
+    size = dwSize
+    if dwSize == 0:
+        for start, end, _ in u.mem_regions():
+            if start == lpAddress:
+                size = end - start + 1
+                break
+    if dwSize != 0:
+        dealloc_memory(free_alloc, lpAddress, size)
+        res = 1
+        err = 0
+    else:
+        res = 0
+        err = 6
 
-def CheckRemoteDebuggerPresent(machine):
+    u.reg_write(UC_X86_REG_RAX, res)
+    log(u, "VirtualFree(%#x, %d, %#x) => %d" % (
+        lpAddress, dwSize, dwFreeType, res
+    ))
+    error(err)
+
+def CheckRemoteDebuggerPresent(u: Uc):
     # BOOL CheckRemoteDebuggerPresent( HANDLE hProcess, PBOOL pbDebuggerPresent );
-    hProcess = machine.cpu.state.rcx
-    pbDebuggerPresent = machine.cpu.state.rdx
-    machine.memory.write(pbDebuggerPresent.value, pack_int8(0))
-    machine.cpu.state.rax.value = 1
-    log(machine, "CheckRemoteDebuggerPresent(%#x, %#x) => %d" % (
-        hProcess.value, pbDebuggerPresent.value, machine.cpu.state.rax.value
+    hProcess = u.reg_read(UC_X86_REG_RCX)
+    pbDebuggerPresent = u.reg_read(UC_X86_REG_RDX)
+    u.mem_write(pbDebuggerPresent, pack_int8(0))
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "CheckRemoteDebuggerPresent(%#x, %#x) => %d" % (
+        hProcess, pbDebuggerPresent, 1
     ))
     error(0)
 
@@ -992,8 +1031,12 @@ def WriteFile(u: Uc):
         file.write(data)
     u.reg_write(UC_X86_REG_R9, nNumberOfBytesToWrite)
     u.reg_write(UC_X86_REG_RAX, 1)
+    try:
+        text = data.decode()
+    except UnicodeDecodeError:
+        text = data.hex()
     log(u, "WriteFile(%#x, \"%s\", %d, %#x, %#x) => %d" % (
-        hFile, data.decode(), nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped,
+        hFile, text, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped,
         u.reg_read(UC_X86_REG_RAX)
     ))
     error(0)
@@ -1755,6 +1798,13 @@ def HeapSetInformation(machine):
     ))
     error(0)
 
+def ExitProcess(u: Uc):
+    # void ExitProcess( UINT uExitCode );
+    uExitCode = u.reg_read(UC_X86_REG_RCX)
+    u.reg_write(UC_X86_REG_RIP, 0)
+    log(u, "ExitProcess(%d)" % uExitCode)
+    error(0)
+
 
 # def _initterm(machine):
 #     # ?
@@ -2095,6 +2145,7 @@ api_list = [
     CreateTimerQueueTimer,
     GetNumaHighestNodeNumber,
     HeapSetInformation,
+    ExitProcess,
     # _initterm,
     # _initterm_e,
     # _onexit,
