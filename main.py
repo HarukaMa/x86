@@ -99,15 +99,14 @@ def main():
             if data[0] == 0x06:
                 s = "%#x  import handler %s"
                 i = u.__getattribute__("imports")[read_int32(data[1:5])]
-                import_name = u.__getattribute__("imports")[read_int32(data[1:5])]
                 found = False
                 for func in api_list:
-                    if import_name == func.__name__:
+                    if i == func.__name__:
                         func(u)
                         found = True
                         break
                 if not found:
-                    print(import_name, file=sys.stderr)
+                    print(i, file=sys.stderr)
                     raise NotImplementedError
                 rsp = u.reg_read(UC_X86_REG_RSP)
                 u.reg_write(UC_X86_REG_RIP, read_uint64(u.mem_read(rsp, 8)))
@@ -116,7 +115,18 @@ def main():
             elif data[0] == 0x07:
                 s = "%#x  dynamic import handler %s"
                 i = u.__getattribute__("dynamic_imports")[read_int32(data[1:5])]
-                raise NotImplementedError
+                found = False
+                for func in api_list:
+                    if i == func.__name__:
+                        func(u)
+                        found = True
+                        break
+                if not found:
+                    raise NotImplementedError
+                rsp = u.reg_read(UC_X86_REG_RSP)
+                u.reg_write(UC_X86_REG_RIP, read_uint64(u.mem_read(rsp, 8)))
+                rsp += 8
+                u.reg_write(UC_X86_REG_RSP, rsp)
             else:
                 raise NotImplementedError
             print(s % (address, i))

@@ -7,8 +7,10 @@ import time
 from io import SEEK_SET
 from typing import List, Dict, BinaryIO, Any, TextIO, Union
 
-from unicorn import Uc, UC_QUERY_ARCH, UC_MODE_64, UC_QUERY_MODE
-from unicorn.x86_const import UC_X86_REG_RCX, UC_X86_REG_RAX, UC_X86_REG_RSP
+from unicorn import Uc, UC_QUERY_ARCH, UC_MODE_64, UC_QUERY_MODE, UC_MEM_READ, UC_PROT_NONE, UC_PROT_READ, UC_PROT_EXEC, \
+    UC_PROT_WRITE
+from unicorn.x86_const import UC_X86_REG_RCX, UC_X86_REG_RAX, UC_X86_REG_RSP, UC_X86_REG_RDX, UC_X86_REG_R8D, \
+    UC_X86_REG_R8, UC_X86_REG_R9
 
 from exc import Exited
 from utils import pack_int64, read_int32, pack_int32, read_int64, pack_int16, read_int16, pack_int8
@@ -166,70 +168,98 @@ def GetModuleHandleW(machine):
     log(machine, "GetModuleHandleW(\"%s\") => %#x" % (buf.decode("utf-16le"), handle))
     error(0)
 
-def GetProcAddress(machine):
+def GetProcAddress(u: Uc):
     # FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
-    hModule = machine.cpu.state.rcx
-    lpProcName = machine.cpu.state.rdx
-    module = pack_int32(hModule.value).decode()
-    tmp = machine.cpu.state.rcx.value
-    machine.cpu.state.rcx.value = lpProcName.value
-    strlen(machine)
-    machine.cpu.state.rcx.value = tmp
-    size = machine.cpu.state.rax.value
-    proc = machine.memory.read(lpProcName, size).decode()
+    hModule = u.reg_read(UC_X86_REG_RCX)
+    lpProcName = u.reg_read(UC_X86_REG_RDX)
+    module = pack_int32(hModule).decode()
+    tmp = u.reg_read(UC_X86_REG_RCX)
+    u.reg_write(UC_X86_REG_RCX, lpProcName)
+    strlen(u)
+    u.reg_write(UC_X86_REG_RCX, tmp)
+    size = u.reg_read(UC_X86_REG_RAX)
+    proc = u.mem_read(lpProcName, size).decode()
     found = False
-    for func in machine.api_list:
+    for func in api_list:
         if proc == func.__name__:
             found = True
             break
     if not found:
-        log(machine, f"NOT IMPLEMENTED {module} {proc}")
+        log(u, f"NOT IMPLEMENTED {module} {proc}")
         # raise NotImplementedError
-    pos = len(machine.dynamic_imports)
-    machine.cpu.state.rax.value = pos * 256 + 7
-    log(machine, "GetProcAddress(\"%s\", \"%s\") => %#x" % (module, proc, machine.cpu.state.rax.value))
-    machine.dynamic_imports.append(proc)
+    pos = len(u.__getattribute__("dynamic_imports"))
+    u.mem_write(0x30000 + pos * 8, pack_int64(pos * 256 + 7))
+    u.reg_write(UC_X86_REG_RAX, 0x30000 + pos * 8)
+    log(u, "GetProcAddress(\"%s\", \"%s\") => %#x" % (module, proc, 0x30000 + pos * 8))
+    u.__getattribute__("dynamic_imports").append(proc)
     error(0)
 
-def VirtualProtect(machine):
+mem_protect_u_w = {
+    UC_PROT_NONE: 0x01,
+    UC_PROT_READ: 0x02,
+    UC_PROT_READ | UC_PROT_WRITE: 0x04,
+    UC_PROT_READ | UC_PROT_EXEC: 0x20,
+    UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC: 0x40,
+}
+
+mem_protect_w_u = {
+    0x01: UC_PROT_NONE,
+    0x02: UC_PROT_READ,
+    0x04: UC_PROT_READ | UC_PROT_WRITE,
+    0x20: UC_PROT_READ | UC_PROT_EXEC,
+    0x40: UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC,
+}
+
+def VirtualProtect(u: Uc):
     # BOOL VirtualProtect( LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect );
-    lpAddress = machine.cpu.state.rcx
-    dwSize = machine.cpu.state.rdx
-    flNewProtect = machine.cpu.state.r8d
-    lpflOldProtect = machine.cpu.state.r9d
-    machine.memory.write(lpflOldProtect, pack_int32(0x40))
-    machine.cpu.state.rax.value = 1
-    log(machine, "VirtualProtect(%#x, %#x, %#x, %#x) => %d" % (
-        lpAddress.value, dwSize.value, flNewProtect.value, lpflOldProtect.value, machine.cpu.state.rax.value
+    lpAddress = u.reg_read(UC_X86_REG_RCX)
+    dwSize = u.reg_read(UC_X86_REG_RDX)
+    flNewProtect = u.reg_read(UC_X86_REG_R8)
+    lpflOldProtect = u.reg_read(UC_X86_REG_R9)
+    for mem in u.mem_regions():
+        if mem[0] <= lpAddress <= mem[1]:
+            old_protect = mem_protect_u_w[mem[2]]
+            u.mem_write(lpflOldProtect, pack_int32(old_protect))
+            u.mem_protect(lpAddress, dwSize, mem_protect_w_u[flNewProtect])
+            u.reg_write(UC_X86_REG_RAX, 1)
+            log(u, "VirtualProtect(%#x, %#x, %#x, %#x) => %d" % (
+                lpAddress, dwSize, flNewProtect, lpflOldProtect, u.reg_read(UC_X86_REG_RAX)
+            ))
+            error(0)
+            return
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "VirtualProtect(%#x, %#x, %#x, %#x) => %d" % (
+        lpAddress, dwSize, flNewProtect, lpflOldProtect, u.reg_read(UC_X86_REG_RAX)
     ))
-    error(0)
+    error(6)
 
-def GetModuleFileNameW(machine):
+
+def GetModuleFileNameW(u: Uc):
     # DWORD GetModuleFileNameW( HMODULE hModule, LPWSTR lpFilename, DWORD nSize );
-    hModule = machine.cpu.state.rcx
-    lpFilename = machine.cpu.state.rdx
-    nSize = machine.cpu.state.r8
-    if hModule.value == (0x140000000 if machine.mode == 64 else 0x400000) or hModule.value == 0:
-        tmp = machine.cpu.state.rcx.value
-        machine.cpu.state.rcx.value = 0x10100
-        strlen(machine)
-        machine.cpu.state.rcx.value = tmp
-        size = machine.cpu.state.rax.value
-        filename = machine.memory.read(0x10100, size).decode()
-        if size > nSize.value:
+    hModule = u.reg_read(UC_X86_REG_RCX)
+    lpFilename = u.reg_read(UC_X86_REG_RDX)
+    nSize = u.reg_read(UC_X86_REG_R8)
+    if hModule == (0x140000000 if u.query(UC_QUERY_MODE) == UC_MODE_64 else 0x400000) or hModule == 0:
+        tmp = u.reg_read(UC_X86_REG_RCX)
+        u.reg_write(UC_X86_REG_RCX, 0x10100)
+        strlen(u)
+        u.reg_write(UC_X86_REG_RCX, tmp)
+        size = u.reg_read(UC_X86_REG_RAX)
+        filename = u.mem_read(0x10100, size).decode()
+        if size > nSize:
             filename = filename[:nSize]
-            size = nSize.value
+            size = nSize
         data = filename.encode("utf-16le")
-        machine.memory.write(lpFilename, data + b"\x00\x00")
-        machine.cpu.state.rax.value = size
-        log(machine, "GetModuleFileNameW(%#x, %#x, %d) => %d (\"%s\")" %(
-            hModule.value, lpFilename.value, nSize.value, machine.cpu.state.rax.value, filename
+        u.mem_write(lpFilename, data + b"\x00\x00")
+        u.reg_write(UC_X86_REG_RAX, size)
+        log(u, "GetModuleFileNameW(%#x, %#x, %d) => %d (\"%s\")" %(
+            hModule, lpFilename, nSize, size, filename
         ))
         error(0)
     else:
-        machine.cpu.state.rax.value = 0
-        log(machine, "GetModuleFileNameW(%#x, %#x, %d) => %d" % (
-            hModule.value, lpFilename.value, nSize.value, machine.cpu.state.rax.value
+        u.reg_write(UC_X86_REG_RAX, 0)
+        log(u, "GetModuleFileNameW(%#x, %#x, %d) => %d" % (
+            hModule, lpFilename, nSize, 0
         ))
         raise NotImplementedError
 
@@ -271,52 +301,53 @@ def GetModuleFileNameA(machine):
     ))
     error(err)
 
-def CreateFileW(machine):
+def CreateFileW(u: Uc):
     # HANDLE CreateFileW( LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
     # LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
     # HANDLE hTemplateFile );
-    lpFileName = machine.cpu.state.rcx
-    dwDesiredAccess = machine.cpu.state.rdx
-    dwShareMode = machine.cpu.state.r8
-    lpSecurityAttributes = machine.cpu.state.r9
-    dwCreationDisposition = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
-    dwFlagsAndAttributes = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x30, 8))
-    hTemplateFile = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x38, 8))
-    wcslen(machine)
-    size = machine.cpu.state.rax.value
-    filename = machine.memory.read(lpFileName, size * 2).decode("utf-16le")
-    filename_converted = filename.replace("\\", "/")
+    lpFileName = u.reg_read(UC_X86_REG_RCX)
+    dwDesiredAccess = u.reg_read(UC_X86_REG_RDX)
+    dwShareMode = u.reg_read(UC_X86_REG_R8)
+    lpSecurityAttributes = u.reg_read(UC_X86_REG_R9)
+    rsp = u.reg_read(UC_X86_REG_RSP)
+    dwCreationDisposition = read_int64(u.mem_read(rsp + 0x28, 8))
+    dwFlagsAndAttributes = read_int64(u.mem_read(rsp + 0x30, 8))
+    hTemplateFile = read_int64(u.mem_read(rsp + 0x38, 8))
+    wcslen(u)
+    size = u.reg_read(UC_X86_REG_RAX)
+    filename = u.mem_read(lpFileName, size * 2).decode("utf-16le")
+    # filename_converted = filename.replace("\\", "/")
     if dwFlagsAndAttributes & 0x2000000:
         # try dir
-        if os.path.exists(filename_converted):
+        if os.path.exists(filename):
             global next_dir_handle
             handle = next_dir_handle + 0x40000
-            dir_handles[next_dir_handle] = filename_converted
+            dir_handles[next_dir_handle] = filename
             next_dir_handle += 1
-            log(machine, "CreateFileW dir %s" % filename)
-            machine.cpu.state.rax.value = handle
+            log(u, "CreateFileW dir %s" % filename)
+            u.reg_write(UC_X86_REG_RAX, handle)
             return
     global next_file_handle
     handle = next_file_handle + 0x10000
     mode = ""
-    if dwDesiredAccess.value & 0x40000000 == 0x40000000:
+    if dwDesiredAccess & 0x40000000 == 0x40000000:
         mode = "wb"
-    if dwDesiredAccess.value & 0x80000000 == 0x80000000:
+    if dwDesiredAccess & 0x80000000 == 0x80000000:
         mode = "rb"
-    if dwDesiredAccess.value & 0xC0000000 == 0xC0000000:
+    if dwDesiredAccess & 0xC0000000 == 0xC0000000:
         mode = "rb+"
     try:
-        file = open(filename_converted, mode)
+        file = open(filename, mode)
         file_handles[next_file_handle] = file
         next_file_handle += 1
-        machine.cpu.state.rax.value = handle
+        u.reg_write(UC_X86_REG_RAX, handle)
         error(0)
     except:
-        machine.cpu.state.rax.value = -1
+        u.reg_write(UC_X86_REG_RAX, -1)
         error(2)
-    log(machine, "CreateFileW(\"%s\", %#x, %#x, %#x, %#x, %#x, %#x) => %#x" % (
-        filename, dwDesiredAccess.value, dwShareMode.value, lpSecurityAttributes.value,
-        dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile, machine.cpu.state.rax.value
+    log(u, "CreateFileW(\"%s\", %#x, %#x, %#x, %#x, %#x, %#x) => %#x" % (
+        filename, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+        dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile, u.reg_read(UC_X86_REG_RAX)
     ))
 
 def CreateFileA(machine):
@@ -366,37 +397,38 @@ def CreateFileA(machine):
         dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile, machine.cpu.state.rax.value
     ))
 
-def CreateFileMappingA(machine):
+def CreateFileMappingA(u: Uc):
     # HANDLE CreateFileMappingA( HANDLE hFile, LPSECURITY_ATTRIBUTES lpFileMappingAttributes, DWORD flProtect,
     # DWORD dwMaximumSizeHigh, DWORD dwMaximumSizeLow, LPCSTR lpName );
-    hFile = machine.cpu.state.rcx
-    lpFileMappingAttributes = machine.cpu.state.rdx
-    flProtect = machine.cpu.state.r8
-    dwMaximumSizeHigh = machine.cpu.state.r9
-    dwMaximumSizeLow = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
-    lpName = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x30, 8))
-    if dwMaximumSizeHigh.value or dwMaximumSizeLow:
+    hFile = u.reg_read(UC_X86_REG_RCX)
+    lpFileMappingAttributes = u.reg_read(UC_X86_REG_RDX)
+    flProtect = u.reg_read(UC_X86_REG_R8)
+    dwMaximumSizeHigh = u.reg_read(UC_X86_REG_R9)
+    rsp = u.reg_read(UC_X86_REG_RSP)
+    dwMaximumSizeLow = read_int64(u.mem_read(rsp + 0x28, 8))
+    lpName = read_int64(u.mem_read(rsp + 0x30, 8))
+    if dwMaximumSizeHigh or dwMaximumSizeLow:
         raise NotImplementedError
-    if file_handles.get(hFile.value - 0x10000) is None:
+    if file_handles.get(hFile - 0x10000) is None:
         raise ValueError
     global next_file_mapping
     handle = next_file_mapping + 0x20000
-    file_mappings[next_file_mapping] = hFile.value - 0x10000
+    file_mappings[next_file_mapping] = hFile - 0x10000
     if lpName != 0:
-        tmp = machine.cpu.state.rcx.value
-        machine.cpu.state.rcx.value = lpName
-        strlen(machine)
-        machine.cpu.state.rcx.value = tmp
-        size = machine.cpu.state.rax.value
-        mapping_name = machine.memory.read(lpName, size).decode()
+        tmp = u.reg_read(UC_X86_REG_RCX)
+        u.reg_write(UC_X86_REG_RCX, lpName)
+        strlen(u)
+        u.reg_write(UC_X86_REG_RCX, tmp)
+        size = u.reg_read(UC_X86_REG_RAX)
+        mapping_name = u.mem_read(lpName, size).decode()
     else:
         mapping_name = "NULL"
     file_mappings_name[next_file_mapping] = mapping_name
     next_file_mapping += 1
-    machine.cpu.state.rax.value = handle
-    log(machine, "CreateFileMappingA(%#x(\"%s\"), %#x, %#x, %#x, %#x, \"%s\") => %#x" % (
-        hFile.value, file_handles[hFile.value - 0x10000].name, lpFileMappingAttributes.value, flProtect.value,
-        dwMaximumSizeHigh.value, dwMaximumSizeLow, mapping_name, machine.cpu.state.rax.value
+    u.reg_write(UC_X86_REG_RAX, handle)
+    log(u, "CreateFileMappingA(%#x(\"%s\"), %#x, %#x, %#x, %#x, \"%s\") => %#x" % (
+        hFile, file_handles[hFile - 0x10000].name, lpFileMappingAttributes, flProtect,
+        dwMaximumSizeHigh, dwMaximumSizeLow, mapping_name, u.reg_read(UC_X86_REG_RAX)
     ))
     error(0)
 
@@ -465,17 +497,18 @@ def OpenFileMappingW(machine):
     ))
     error(err)
 
-def MapViewOfFile(machine):
+def MapViewOfFile(u: Uc):
     # LPVOID MapViewOfFile( HANDLE hFileMappingObject, DWORD dwDesiredAccess, DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow, SIZE_T dwNumberOfBytesToMap );
-    hFileMappingObject = machine.cpu.state.rcx
-    dwDesiredAccess = machine.cpu.state.rdx
-    dwFileOffsetHigh = machine.cpu.state.r8
-    dwFileOffsetLow = machine.cpu.state.r9
-    dwNumberOfBytesToMap = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
-    handle = hFileMappingObject.value - 0x20000
+    hFileMappingObject = u.reg_read(UC_X86_REG_RCX)
+    dwDesiredAccess = u.reg_read(UC_X86_REG_RDX)
+    dwFileOffsetHigh = u.reg_read(UC_X86_REG_R8)
+    dwFileOffsetLow = u.reg_read(UC_X86_REG_R9)
+    rsp = u.reg_read(UC_X86_REG_RSP)
+    dwNumberOfBytesToMap = read_int64(u.mem_read(rsp + 0x28, 8))
+    handle = hFileMappingObject - 0x20000
     if file_mappings.get(handle) is None:
         raise ValueError
-    offset = (dwFileOffsetHigh.value << 32) + dwFileOffsetLow.value
+    offset = (dwFileOffsetHigh << 32) + dwFileOffsetLow
     if file_mappings[handle] < 0x100000000:
         file = file_handles[file_mappings[handle]]
         file.seek(offset, SEEK_SET)
@@ -1716,17 +1749,17 @@ def strlen(u: Uc):
         u.reg_write(UC_X86_REG_RAX, res + tmp)
         return
 
-def wcslen(machine):
+def wcslen(u: Uc):
     # size_t wcslen( const wchar_t *str );
-    _str = machine.cpu.state.rcx
+    _str = u.reg_read(UC_X86_REG_RCX)
     res = 0
     while True:
-        buf: bytearray = machine.memory.read(_str + res * 2, 16)
+        buf: bytearray = u.mem_read(_str + res * 2, 16)
         tmp = buf.find(b"\x00\x00")
         if tmp == -1:
             res += 8
             continue
-        machine.cpu.state.rax.value = res + tmp // 2 + 1
+        u.reg_write(UC_X86_REG_RAX, res + tmp // 2 + 1)
         return
 #
 # def strncmp(machine):

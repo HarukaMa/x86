@@ -255,6 +255,7 @@ def load_pe64_u(u: Uc, file: str, arguments=None):
     u.mem_write(0x1e8ce, b"\x0e")
 
     u.mem_map(0x20000, 0x10000) # imports
+    u.mem_map(0x30000, 0x10000) # dynamic imports
     u.mem_map(0x100000, stack_reserve, UC_PROT_READ | UC_PROT_WRITE) # stack
     u.mem_map(0x10000000, heap_reserve, UC_PROT_READ | UC_PROT_WRITE) # heap
 
