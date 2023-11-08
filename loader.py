@@ -258,6 +258,8 @@ def load_pe64_u(u: Uc, file: str, arguments=None):
     u.mem_map(0x30000, 0x10000) # dynamic imports
     u.mem_map(0x100000, stack_reserve, UC_PROT_READ | UC_PROT_WRITE) # stack
     u.mem_map(0x10000000, heap_reserve, UC_PROT_READ | UC_PROT_WRITE) # heap
+    u.__setattr__("free_alloc", [(0x10000000, heap_reserve)])
+    u.__setattr__("free_map", [(0x30000000, 0x10000000)])
 
     u.mem_map(0x0, 0x10000, UC_PROT_READ | UC_PROT_WRITE) # TEB
     u.mem_write(0x8, pack_uint64(0x130000))

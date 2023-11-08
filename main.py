@@ -1,17 +1,20 @@
 import sys
+from typing import Optional
+import time
 
 import capstone
+from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE
+from unicorn.x86_const import UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RDI, \
+    UC_X86_REG_RSI, UC_X86_REG_RBP, UC_X86_REG_RSP, UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_R10, UC_X86_REG_R11, \
+    UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15, UC_X86_REG_XMM0, UC_X86_REG_XMM1, UC_X86_REG_XMM2, \
+    UC_X86_REG_XMM3, UC_X86_REG_RIP, UC_X86_REG_EFLAGS
 
 from exc import Exited
 from imports import api_list
 from machine import Machine
 from loader import load_pe64, load_pe32, load_pe64_u
 
-from unicorn import *
-from unicorn.x86_const import *
-
 from utils import read_int32, read_int64, read_uint64
-
 
 def rflags_to_str(rflags):
     # These are the flag names and their corresponding bit positions
@@ -76,8 +79,8 @@ def main():
     u = Uc(UC_ARCH_X86, UC_MODE_64)
     load_pe64_u(u, sys.argv[1])
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-
-    machine = Machine(debug_start=0, trace_start=None)
+    debug_start: Optional[int] = None
+    machine = Machine(debug_start=debug_start, trace_start=None)
     load_pe64(machine, sys.argv[1])
     # load_pe32(machine, "/Users/MrX/Downloads/chuniApp_c+_origin.exe")
     # load_pe64(machine, "/Users/MrX/Downloads/amdaemon.exe")
@@ -87,58 +90,62 @@ def main():
     # load_pe64(machine, "/tmp/a.exe")
 
     inst_count = 0
+    timer = time.perf_counter_ns()
 
     def hook_all(uc, address, size, _):
-        dump(uc)
-        nonlocal inst_count
+        nonlocal inst_count, timer
+        if inst_count != 0 and inst_count % 100000 == 0:
+            now = time.perf_counter_ns()
+            print(f"{inst_count} ({(now - timer) / 100000} ns per inst)")
+            timer = now
+        debug = False
+        if debug_start is not None and inst_count >= debug_start:
+            debug = True
+            dump(uc)
+
         data = uc.mem_read(address, 20)
-        try:
-            inst = next(md.disasm(data, address))
-            print("%d\t%#x  %s %s" % (inst_count, inst.address, inst.mnemonic, inst.op_str))
-        except:
+
+        if debug:
+            try:
+                inst = next(md.disasm(data, address))
+                print("%d\t%#x  %s %s" % (inst_count, inst.address, inst.mnemonic, inst.op_str))
+            except:
+                if data[0] == 0x06:
+                    s = "%#x  import handler %s"
+                    i = u.__getattribute__("imports")[read_int32(data[1:5])]
+                elif data[0] == 0x07:
+                    s = "%#x  dynamic import handler %s"
+                    i = u.__getattribute__("dynamic_imports")[read_int32(data[1:5])]
+                else:
+                    raise NotImplementedError
+                print(s % (address, i))
+
+        if data[0] in (0x06, 0x07):
             if data[0] == 0x06:
-                s = "%#x  import handler %s"
                 i = u.__getattribute__("imports")[read_int32(data[1:5])]
-                found = False
-                for func in api_list:
-                    if i == func.__name__:
-                        func(u)
-                        found = True
-                        break
-                if not found:
-                    print(i, file=sys.stderr)
-                    raise NotImplementedError
-                rsp = u.reg_read(UC_X86_REG_RSP)
-                u.reg_write(UC_X86_REG_RIP, read_uint64(u.mem_read(rsp, 8)))
-                rsp += 8
-                u.reg_write(UC_X86_REG_RSP, rsp)
-            elif data[0] == 0x07:
-                s = "%#x  dynamic import handler %s"
-                i = u.__getattribute__("dynamic_imports")[read_int32(data[1:5])]
-                found = False
-                for func in api_list:
-                    if i == func.__name__:
-                        func(u)
-                        found = True
-                        break
-                if not found:
-                    raise NotImplementedError
-                rsp = u.reg_read(UC_X86_REG_RSP)
-                u.reg_write(UC_X86_REG_RIP, read_uint64(u.mem_read(rsp, 8)))
-                rsp += 8
-                u.reg_write(UC_X86_REG_RSP, rsp)
             else:
+                i = u.__getattribute__("dynamic_imports")[read_int32(data[1:5])]
+            found = False
+            for func in api_list:
+                if i == func.__name__:
+                    func(u)
+                    found = True
+                    break
+            if not found:
+                print(i, file=sys.stderr)
                 raise NotImplementedError
-            print(s % (address, i))
+            rsp = u.reg_read(UC_X86_REG_RSP)
+            u.reg_write(UC_X86_REG_RIP, read_uint64(u.mem_read(rsp, 8)))
+            rsp += 8
+            u.reg_write(UC_X86_REG_RSP, rsp)
+
         inst_count += 1
 
 
-    try:
-        u.hook_add(UC_HOOK_CODE, hook_all)
-        u.emu_start(u.reg_read(UC_X86_REG_RIP), 0)
-        print(f"{u.reg_read(UC_X86_REG_RIP):#x}")
-    except Exited as e:
-        print("Process finished with exit code %s" % e.status)
+    u.hook_add(UC_HOOK_CODE, hook_all)
+    u.hook_add(UC_HOOK_CODE, machine.hook_code)
+    u.emu_start(u.reg_read(UC_X86_REG_RIP), 0)
+    print(f"{u.reg_read(UC_X86_REG_RIP):#x}")
 
 
     # try:

@@ -13,7 +13,8 @@ from unicorn.x86_const import UC_X86_REG_RCX, UC_X86_REG_RAX, UC_X86_REG_RSP, UC
     UC_X86_REG_R8, UC_X86_REG_R9
 
 from exc import Exited
-from utils import pack_int64, read_int32, pack_int32, read_int64, pack_int16, read_int16, pack_int8
+from utils import pack_int64, read_int32, pack_int32, read_int64, pack_int16, read_int16, pack_int8, read_uint64, \
+    read_uint32
 
 log_file = open("api_log.txt", "w")
 
@@ -47,6 +48,12 @@ def error(value: int):
     # TODO: TEB lasterror
     global lasterror
     lasterror = value
+
+def read_stack_param(u: Uc, index: int):
+    if u.query(UC_QUERY_MODE) == UC_MODE_64:
+        return read_uint64(u.mem_read(u.reg_read(UC_X86_REG_RSP) + 0x28 + 8 * index, 8))
+    else:
+        return read_uint32(u.mem_read(u.reg_read(UC_X86_REG_RSP) + 0x14 + 4 * index, 4))
 
 def GetSystemTimeAsFileTime(machine):
     # void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
@@ -216,6 +223,9 @@ def VirtualProtect(u: Uc):
     dwSize = u.reg_read(UC_X86_REG_RDX)
     flNewProtect = u.reg_read(UC_X86_REG_R8)
     lpflOldProtect = u.reg_read(UC_X86_REG_R9)
+    if 0x10000000 <= lpAddress <= 0x40000000:
+        # conflict with current simplified memory alloc model
+        raise NotImplementedError
     for mem in u.mem_regions():
         if mem[0] <= lpAddress <= mem[1]:
             old_protect = mem_protect_u_w[mem[2]]
@@ -263,41 +273,36 @@ def GetModuleFileNameW(u: Uc):
         ))
         raise NotImplementedError
 
-def GetModuleFileNameA(machine):
+def GetModuleFileNameA(u: Uc):
     # DWORD GetModuleFileNameA( HMODULE hModule, LPSTR lpFilename, DWORD nSize );
-    hModule = machine.cpu.state.rcx
-    lpFilename = machine.cpu.state.rdx
-    nSize = machine.cpu.state.r8
+    hModule = u.reg_read(UC_X86_REG_RCX)
+    lpFilename = u.reg_read(UC_X86_REG_RDX)
+    nSize = u.reg_read(UC_X86_REG_R8)
     filename = None
-    if hModule.value == 0:
-        for start, size in machine.memory.mapped.items():
-            if start <= machine.cpu.state.rip.value < start + size:
-                filename = machine.memory.names[start]
+    if hModule == 0 or hModule == (0x140000000 if u.query(UC_QUERY_MODE) == UC_MODE_64 else 0x400000):
+        tmp = u.reg_read(UC_X86_REG_RCX)
+        u.reg_write(UC_X86_REG_RCX, 0x10100)
+        strlen(u)
+        u.reg_write(UC_X86_REG_RCX, tmp)
+        size = u.reg_read(UC_X86_REG_RAX)
+        filename = u.mem_read(0x10100, size).decode()
     else:
-        if hModule.value == (0x140000000 if machine.mode == 64 else 0x400000):
-            tmp = machine.cpu.state.rcx.value
-            machine.cpu.state.rcx.value = 0x10100
-            strlen(machine)
-            machine.cpu.state.rcx.value = tmp
-            size = machine.cpu.state.rax.value
-            filename = machine.memory.read(0x10100, size).decode()
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
     err = 0
     if filename is None:
         err = 6
         size = 0
     else:
         size = len(filename)
-        if size > nSize.value:
+        if size > nSize:
             filename = filename[:nSize - 1]
-            size = nSize.value
+            size = nSize
             err = 122
         data = filename.encode()
-        machine.memory.write(lpFilename, data + b"\x00")
-    machine.cpu.state.rax.value = size
-    log(machine, "GetModuleFileNameW(%#x, %#x, %d) => %d (\"%s\")" % (
-        hModule.value, lpFilename.value, nSize.value, machine.cpu.state.rax.value, filename
+        u.mem_write(lpFilename, data + b"\x00")
+    u.reg_write(UC_X86_REG_RAX, size)
+    log(u, "GetModuleFileNameW(%#x, %#x, %d) => %d (\"%s\")" % (
+        hModule, lpFilename, nSize, size, filename
     ))
     error(err)
 
@@ -413,7 +418,6 @@ def CreateFileMappingA(u: Uc):
         raise ValueError
     global next_file_mapping
     handle = next_file_mapping + 0x20000
-    file_mappings[next_file_mapping] = hFile - 0x10000
     if lpName != 0:
         tmp = u.reg_read(UC_X86_REG_RCX)
         u.reg_write(UC_X86_REG_RCX, lpName)
@@ -422,7 +426,19 @@ def CreateFileMappingA(u: Uc):
         size = u.reg_read(UC_X86_REG_RAX)
         mapping_name = u.mem_read(lpName, size).decode()
     else:
-        mapping_name = "NULL"
+        mapping_name = "\0"
+    if mapping_name != "\0" and mapping_name in file_mappings_name.values():
+        for k, v in file_mappings_name.items():
+            if v == mapping_name:
+                handle = k
+                u.reg_write(UC_X86_REG_RAX, handle)
+                log(u, "CreateFileMappingA(%#x(\"%s\"), %#x, %#x, %#x, %#x, \"%s\") => %#x" % (
+                    hFile, file_handles[hFile - 0x10000].name, lpFileMappingAttributes, flProtect,
+                    dwMaximumSizeHigh, dwMaximumSizeLow, mapping_name, u.reg_read(UC_X86_REG_RAX)
+                ))
+                error(183)
+                return
+    file_mappings[next_file_mapping] = hFile - 0x10000
     file_mappings_name[next_file_mapping] = mapping_name
     next_file_mapping += 1
     u.reg_write(UC_X86_REG_RAX, handle)
@@ -465,7 +481,7 @@ def CreateFileMappingW(machine):
         size = machine.cpu.state.rax.value
         mapping_name = machine.memory.read(lpName, size * 2).decode("utf-16le")
     else:
-        mapping_name = "NULL"
+        mapping_name = "\0"
     file_mappings_name[next_file_mapping] = mapping_name
     next_file_mapping += 1
     machine.cpu.state.rax.value = handle
@@ -503,8 +519,7 @@ def MapViewOfFile(u: Uc):
     dwDesiredAccess = u.reg_read(UC_X86_REG_RDX)
     dwFileOffsetHigh = u.reg_read(UC_X86_REG_R8)
     dwFileOffsetLow = u.reg_read(UC_X86_REG_R9)
-    rsp = u.reg_read(UC_X86_REG_RSP)
-    dwNumberOfBytesToMap = read_int64(u.mem_read(rsp + 0x28, 8))
+    dwNumberOfBytesToMap = read_stack_param(u, 0)
     handle = hFileMappingObject - 0x20000
     if file_mappings.get(handle) is None:
         raise ValueError
@@ -516,51 +531,81 @@ def MapViewOfFile(u: Uc):
             data = file.read()
         else:
             raise NotImplementedError
-        name = file.name
+        name = file_mappings_name[handle]
     else:
         data = bytearray([0]) * (file_mappings[handle] & 0xffffffff)
         name = "Pagefile %#x" % handle
-    map_base = 0x30000000
-    res = 0
-    for k, v in machine.memory.names.items():
-        if v == name:
-            res = k
+    res = (0, 0)
+    free_map: list[tuple[int, int]] = u.__getattribute__("free_map")
+    for start, size in free_map:
+        if size >= len(data):
+            res = (start, size)
             break
-    if res == 0:
-        for k, v in machine.memory.mapped.items():
-            if k <= map_base < k + v:
-                map_base = k + v - ((k + v) % 0x1000) + 0x1000
-        machine.memory.map(map_base, len(data), name)
-        machine.memory.write(map_base, data)
-        res = map_base
-    addr_mappings[res] = handle
-    machine.cpu.state.rax.value = res
-    log(machine, "MapViewOfFile(%#x(%#x, \"%s\"), %#x, %#x, %#x, %d) => %#x" % (
-        hFileMappingObject.value, file_mappings[handle], name, dwDesiredAccess.value, dwFileOffsetHigh.value,
-        dwFileOffsetLow.value, dwNumberOfBytesToMap, machine.cpu.state.rax.value
+    if res[0] == 0:
+        u.reg_write(UC_X86_REG_RAX, 0)
+        log(u, "MapViewOfFile(%#x(%#x, \"%s\"), %#x, %#x, %#x, %d) => %#x" % (
+            hFileMappingObject, file_mappings[handle], name, dwDesiredAccess, dwFileOffsetHigh,
+            dwFileOffsetLow, dwNumberOfBytesToMap, 0
+        ))
+        error(8)
+        return
+    if dwNumberOfBytesToMap == 0:
+        size = len(data)
+        if size % 4096 != 0:
+            size = (size // 4096 + 1) * 4096
+    else:
+        size = dwNumberOfBytesToMap
+    free_map.remove(res)
+    free_map.append((res[0] + size, res[1] - size))
+    free_map.sort(key=lambda b: b[0])
+    u.mem_map(res[0], size)
+    u.mem_write(res[0], data)
+
+    u.reg_write(UC_X86_REG_RAX, res[0])
+    log(u, "MapViewOfFile(%#x(%#x, \"%s\"), %#x, %#x, %#x, %d) => %#x" % (
+        hFileMappingObject, file_mappings[handle], name, dwDesiredAccess, dwFileOffsetHigh,
+        dwFileOffsetLow, dwNumberOfBytesToMap, res[0]
     ))
     error(0)
 
-def UnmapViewOfFile(machine):
+def UnmapViewOfFile(u: Uc):
     # BOOL UnmapViewOfFile( LPCVOID lpBaseAddress );
-    lpBaseAddress = machine.cpu.state.rcx
-    mapping = addr_mappings.get(lpBaseAddress.value, None)
-    if mapping is None:
-        raise ValueError
-    machine.memory.unmap(lpBaseAddress.value)
-    if file_mappings[mapping] < 0x100000000:
-        name = file_handles[file_mappings[mapping]].name
-    else:
-        name = "Pagefile %#x" % mapping
-    machine.cpu.state.rax.value = 1
-    log(machine, "UnmapViewOfFile(%#x(\"%s\") => %d" % (lpBaseAddress.value, name, machine.cpu.state.rax.value))
-    error(0)
+    lpBaseAddress = u.reg_read(UC_X86_REG_RCX)
+    if 0x30000000 <= lpBaseAddress < 0x40000000:
+        for start, end, _ in u.mem_regions():
+            size = end - start + 1
+            if start == lpBaseAddress:
+                free_map = u.__getattribute__("free_map")
+                u.mem_unmap(start, size)
+                free_map.append((start, size))
+                free_map.sort(key=lambda b: b[0])
+                last = (0, 0)
+                d = []
+                for block in free_map:
+                    if last[0] + last[1] == block[0]:
+                        d.append(last)
+                        d.append(block)
+                        free_map.append((last[0], last[1] + block[1]))
+                        last = (last[0], last[1] + block[1])
+                    else:
+                        last = block
+                free_map.sort(key=lambda b: b[0])
+                for block in d:
+                    free_map.remove(block)
+                u.reg_write(UC_X86_REG_RAX, 1)
+                log(u, "UnmapViewOfFile(%#x) => %d" % (lpBaseAddress, u.reg_read(UC_X86_REG_RAX)))
+                error(0)
+                return
 
-def CloseHandle(machine):
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "UnmapViewOfFile(%#x => %d" % (lpBaseAddress, 0))
+    error(487)
+
+def CloseHandle(u: Uc):
     # BOOL CloseHandle( HANDLE hObject );
-    hObject = machine.cpu.state.rcx
-    handle = hObject.value & 0xffff
-    if hObject.value & 0x10000:
+    hObject = u.reg_read(UC_X86_REG_RCX)
+    handle = hObject & 0xffff
+    if hObject & 0x10000:
         if file_handles.get(handle) is None:
             raise ValueError
         file_handles[handle].close()
@@ -584,8 +629,8 @@ def CloseHandle(machine):
         # log(machine, "CloseHandle mutex %s" % name)
     else:
         raise NotImplementedError
-    machine.cpu.state.rax.value = 1
-    log(machine, "CloseHandle(%#x) => %d" % (hObject.value, machine.cpu.state.rax.value))
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "CloseHandle(%#x) => %d" % (hObject, u.reg_read(UC_X86_REG_RAX)))
     error(0)
 
 def Beep(machine):
@@ -642,48 +687,48 @@ def IsDebuggerPresent(machine):
     machine.cpu.state.rax.value = 0
     log(machine, "IsDebuggerPresent() => %d" % machine.cpu.state.rax.value)
 
-def GetLocalTime(machine):
+def GetLocalTime(u: Uc):
     # void GetLocalTime( LPSYSTEMTIME lpSystemTime );
-    lpSystemTime = machine.cpu.state.rcx
-    machine.memory.write(lpSystemTime + 0, pack_int16(1970))
-    machine.memory.write(lpSystemTime + 2, pack_int16(1))
-    machine.memory.write(lpSystemTime + 4, pack_int16(1))
-    machine.memory.write(lpSystemTime + 6, pack_int16(4))
-    machine.memory.write(lpSystemTime + 8, pack_int16(0))
-    machine.memory.write(lpSystemTime + 10, pack_int16(0))
-    machine.memory.write(lpSystemTime + 12, pack_int16(0))
-    machine.memory.write(lpSystemTime + 14, pack_int16(0))
-    log(machine, "GetLocalTime(%#x) (1970-01-01 00:00:00)" % lpSystemTime.value)
+    lpSystemTime = u.reg_read(UC_X86_REG_RCX)
+    u.mem_write(lpSystemTime + 0, pack_int16(1970))
+    u.mem_write(lpSystemTime + 2, pack_int16(1))
+    u.mem_write(lpSystemTime + 4, pack_int16(1))
+    u.mem_write(lpSystemTime + 6, pack_int16(4))
+    u.mem_write(lpSystemTime + 8, pack_int16(0))
+    u.mem_write(lpSystemTime + 10, pack_int16(0))
+    u.mem_write(lpSystemTime + 12, pack_int16(0))
+    u.mem_write(lpSystemTime + 14, pack_int16(0))
+    log(u, "GetLocalTime(%#x) (1970-01-01 00:00:00)" % lpSystemTime)
 
-def SystemTimeToFileTime(machine):
+def SystemTimeToFileTime(u: Uc):
     # BOOL SystemTimeToFileTime( const SYSTEMTIME *lpSystemTime, LPFILETIME lpFileTime );
-    lpSystemTime = machine.cpu.state.rcx
-    lpFileTime = machine.cpu.state.rdx
-    year = read_int16(machine.memory.read(lpSystemTime + 0, 2))
-    month = read_int16(machine.memory.read(lpSystemTime + 2, 2))
-    day = read_int16(machine.memory.read(lpSystemTime + 4, 2))
-    hour = read_int16(machine.memory.read(lpSystemTime + 8, 2))
-    minute = read_int16(machine.memory.read(lpSystemTime + 10, 2))
-    second = read_int16(machine.memory.read(lpSystemTime + 12, 2))
-    ms = read_int16(machine.memory.read(lpSystemTime + 14, 2))
+    lpSystemTime = u.reg_read(UC_X86_REG_RCX)
+    lpFileTime = u.reg_read(UC_X86_REG_RDX)
+    year = read_int16(u.mem_read(lpSystemTime + 0, 2))
+    month = read_int16(u.mem_read(lpSystemTime + 2, 2))
+    day = read_int16(u.mem_read(lpSystemTime + 4, 2))
+    hour = read_int16(u.mem_read(lpSystemTime + 8, 2))
+    minute = read_int16(u.mem_read(lpSystemTime + 10, 2))
+    second = read_int16(u.mem_read(lpSystemTime + 12, 2))
+    ms = read_int16(u.mem_read(lpSystemTime + 14, 2))
     date = datetime.datetime(year, month, day, hour, minute, second, ms)
-    machine.memory.write(lpFileTime,
-                         pack_int64(int((date - _FILETIME_null_date).total_seconds() * 10000000)))
-    machine.cpu.state.rax.value = 1
-    log(machine, "SystemTimeToFileTime(%#x, %#x) => %d (%s)" % (
-        lpSystemTime.value, lpFileTime.value, machine.cpu.state.rax.value, date
+    u.mem_write(lpFileTime,
+                pack_int64(int((date - _FILETIME_null_date).total_seconds() * 10000000)))
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "SystemTimeToFileTime(%#x, %#x) => %d (%s)" % (
+        lpSystemTime, lpFileTime, u.reg_read(UC_X86_REG_RAX), date
     ))
     error(0)
 
-def GetTempPathW(machine):
+def GetTempPathW(u: Uc):
     # DWORD GetTempPathW( DWORD nBufferLength, LPWSTR lpBuffer );
-    nBufferLength = machine.cpu.state.rcx
-    lpBuffer = machine.cpu.state.rdx
+    nBufferLength = u.reg_read(UC_X86_REG_RCX)
+    lpBuffer = u.reg_read(UC_X86_REG_RDX)
     filename = "c:\\temp\\".encode("utf-16le")
-    machine.memory.write(lpBuffer, filename + b"\x00\x00")
-    machine.cpu.state.rax.value = 5
-    log(machine, "GetTempPathW(%d, %#x) => %d (\"%s\")" % (
-        nBufferLength.value, lpBuffer.value, machine.cpu.state.rax.value, "/tmp"
+    u.mem_write(lpBuffer, filename + b"\x00\x00")
+    u.reg_write(UC_X86_REG_RAX, 8)
+    log(u, "GetTempPathW(%d, %#x) => %d (\"%s\")" % (
+        nBufferLength, lpBuffer, 8, "c:\\temp\\"
     ))
     error(0)
 
@@ -692,22 +737,22 @@ def GetVersion(machine):
     machine.cpu.state.rax.value = 0x0000000a
     log(machine, "GetVersion() => %#x" % machine.cpu.state.rax.value)
 
-def GetVersionExA(machine):
+def GetVersionExA(u: Uc):
     # BOOL GetVersionExA( LPOSVERSIONINFOA lpVersionInformation );
-    lpVersionInformation = machine.cpu.state.rcx
-    size = read_int32(machine.memory.read(lpVersionInformation, 4))
+    lpVersionInformation = u.reg_read(UC_X86_REG_RCX)
+    size = read_int32(u.mem_read(lpVersionInformation, 4))
     if size == 148:
         # OSVERSIONINFOA
-        machine.memory.write(lpVersionInformation + 4, pack_int32(10))
-        machine.memory.write(lpVersionInformation + 8, pack_int32(0))
-        machine.memory.write(lpVersionInformation + 12, pack_int32(0))
-        machine.memory.write(lpVersionInformation + 16, pack_int32(2))
-        machine.memory.write(lpVersionInformation + 20, b"\x00")
+        u.mem_write(lpVersionInformation + 4, pack_int32(10))
+        u.mem_write(lpVersionInformation + 8, pack_int32(0))
+        u.mem_write(lpVersionInformation + 12, pack_int32(0))
+        u.mem_write(lpVersionInformation + 16, pack_int32(2))
+        u.mem_write(lpVersionInformation + 20, b"\x00")
     else:
         # OSVERSIONINFOEXA
         raise NotImplementedError
-    machine.cpu.state.rax.value = 1
-    log(machine, "GetVersionExA(%#x) => %d" % (lpVersionInformation.value, machine.cpu.state.rax.value))
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "GetVersionExA(%#x) => %d" % (lpVersionInformation, 1))
     error(0)
 
 def GetVersionExW(machine):
@@ -728,162 +773,178 @@ def GetVersionExW(machine):
     log(machine, "GetVersionExW(%#x) => %d" % (lpVersionInformation.value, machine.cpu.state.rax.value))
     error(0)
 
-def GetTempFileNameW(machine):
+def GetTempFileNameW(u: Uc):
     # UINT GetTempFileNameW( LPCWSTR lpPathName, LPCWSTR lpPrefixString, UINT uUnique, LPWSTR lpTempFileName );
-    lpPathName = machine.cpu.state.rcx
-    lpPrefixString = machine.cpu.state.rdx
-    uUnique = machine.cpu.state.r8
-    lpTempFileName = machine.cpu.state.r9
-    wcslen(machine)
+    lpPathName = u.reg_read(UC_X86_REG_RCX)
+    lpPrefixString = u.reg_read(UC_X86_REG_RDX)
+    uUnique = u.reg_read(UC_X86_REG_R8)
+    lpTempFileName = u.reg_read(UC_X86_REG_R9)
+    wcslen(u)
     total_size = 0
-    size = machine.cpu.state.rax.value
+    size = u.reg_read(UC_X86_REG_RAX)
     total_size += size
-    buffer = machine.memory.read(lpPathName, size * 2)
+    buffer = u.mem_read(lpPathName, size * 2)
     pathname = buffer.decode("utf-16le")
-    tmp = machine.cpu.state.rcx.value
-    machine.cpu.state.rcx.value = machine.cpu.state.rdx.value
-    wcslen(machine)
-    machine.cpu.state.rcx.value = tmp
-    size = machine.cpu.state.rax.value
-    buffer += machine.memory.read(lpPrefixString, size * 2)
-    prefixstring = machine.memory.read(lpPrefixString, size * 2).decode("utf-16le")
-    total_size += size + len(str(uUnique.value))
-    machine.memory.write(lpTempFileName, buffer + str(uUnique.value).encode("utf-16le") + b"\x00\x00")
-    machine.cpu.state.rax.value = total_size
-    log(machine, "GetTempFileNameW(\"%s\", \"%s\", %d, %#x) => %d (%s%d)" % (
-        pathname, prefixstring, uUnique.value, lpTempFileName.value, machine.cpu.state.rax.value,
-        buffer.decode("utf-16le"), uUnique.value
+    tmp = u.reg_read(UC_X86_REG_RCX)
+    u.reg_write(UC_X86_REG_RCX, lpPrefixString)
+    wcslen(u)
+    u.reg_write(UC_X86_REG_RCX, tmp)
+    size = u.reg_read(UC_X86_REG_RAX)
+    buffer += u.mem_read(lpPrefixString, size * 2)
+    prefixstring = u.mem_read(lpPrefixString, size * 2).decode("utf-16le")
+    total_size += size + len(str(uUnique))
+    u.mem_write(lpTempFileName, bytes(buffer + str(uUnique).encode("utf-16le") + b"\x00\x00"))
+    u.reg_write(UC_X86_REG_RAX, total_size)
+    log(u, "GetTempFileNameW(\"%s\", \"%s\", %d, %#x) => %d (%s%d)" % (
+        pathname, prefixstring, uUnique, lpTempFileName, u.reg_read(UC_X86_REG_RAX),
+        buffer.decode("utf-16le"), uUnique
     ))
     error(0)
 
-def DeleteFileW(machine):
+def DeleteFileW(u: Uc):
     # BOOL DeleteFileW( LPCWSTR lpFileName );
-    lpFileName = machine.cpu.state.rcx
-    wcslen(machine)
-    size = machine.cpu.state.rax.value
-    buffer = machine.memory.read(lpFileName, size * 2)
-    machine.cpu.state.rax.value = 0
-    log(machine, "DeleteFileW(\"%s\") => %d" % (buffer.decode("utf-16le"), machine.cpu.state.rax.value))
+    lpFileName = u.reg_read(UC_X86_REG_RCX)
+    wcslen(u)
+    size = u.reg_read(UC_X86_REG_RAX)
+    buffer = u.mem_read(lpFileName, size * 2)
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "DeleteFileW(\"%s\") => %d" % (buffer.decode("utf-16le"), 0))
     error(2)
 
-def GetVolumeInformationW(machine):
+def GetVolumeInformationW(u: Uc):
     # BOOL GetVolumeInformationW(
     # LPCWSTR lpRootPathName, LPWSTR lpVolumeNameBuffer, DWORD nVolumeNameSize, LPDWORD lpVolumeSerialNumber,
     # LPDWORD lpMaximumComponentLength, LPDWORD lpFileSystemFlags, LPWSTR lpFileSystemNameBuffer, DWORD nFileSystemNameSize );
-    lpRootPathName = machine.cpu.state.rcx
-    lpVolumeNameBuffer = machine.cpu.state.rdx
-    nVolumeNameSize = machine.cpu.state.r8
-    lpVolumeSerialNumber = machine.cpu.state.r9
-    lpMaximumComponentLength = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
-    lpFileSystemFlags = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x30, 8))
-    lpFileSystemNameBuffer = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x38, 8))
-    nFileSystemNameSize = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x40, 8))
-    if lpVolumeNameBuffer.value != 0:
+    lpRootPathName = u.reg_read(UC_X86_REG_RCX)
+    lpVolumeNameBuffer = u.reg_read(UC_X86_REG_RDX)
+    nVolumeNameSize = u.reg_read(UC_X86_REG_R8)
+    lpVolumeSerialNumber = u.reg_read(UC_X86_REG_R9)
+    lpMaximumComponentLength = read_stack_param(u, 0)
+    lpFileSystemFlags = read_stack_param(u, 1)
+    lpFileSystemNameBuffer = read_stack_param(u, 2)
+    nFileSystemNameSize = read_stack_param(u, 3)
+    if lpVolumeNameBuffer != 0:
         raise NotImplementedError
-    if lpVolumeSerialNumber.value != 0:
-        machine.memory.write(lpVolumeSerialNumber, pack_int32(0x0123ab67))
-    machine.memory.write(lpMaximumComponentLength, pack_int32(255))
-    machine.memory.write(lpFileSystemFlags, pack_int32(0x4))
+    if lpVolumeSerialNumber != 0:
+        u.mem_write(lpVolumeSerialNumber, pack_int32(0x0123ab67))
+    u.mem_write(lpMaximumComponentLength, pack_int32(255))
+    u.mem_write(lpFileSystemFlags, pack_int32(0x4))
     if lpFileSystemNameBuffer != 0:
         raise NotImplementedError
-    wcslen(machine)
-    size = machine.cpu.state.rax.value
-    buffer = machine.memory.read(lpRootPathName, size * 2)
-    machine.cpu.state.rax.value = 1
-    log(machine, "GetVolumeInformationW(\"%s\", %#x, %d, %#x, %#x, %#x, %#x, %d) => %d" % (
-        buffer.decode("utf-16le"), lpVolumeNameBuffer.value, nVolumeNameSize.value, lpVolumeSerialNumber.value,
+    wcslen(u)
+    size = u.reg_read(UC_X86_REG_RAX)
+    buffer = u.mem_read(lpRootPathName, size * 2)
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "GetVolumeInformationW(\"%s\", %#x, %d, %#x, %#x, %#x, %#x, %d) => %d" % (
+        buffer.decode("utf-16le"), lpVolumeNameBuffer, nVolumeNameSize, lpVolumeSerialNumber,
         lpMaximumComponentLength, lpFileSystemFlags, lpFileSystemNameBuffer, nFileSystemNameSize,
-        machine.cpu.state.rax.value
+        1
     ))
     error(0)
 
-def GetSystemTime(machine):
+def GetSystemTime(u: Uc):
     # void GetSystemTime( LPSYSTEMTIME lpSystemTime );
-    lpSystemTime = machine.cpu.state.rcx
-    machine.memory.write(lpSystemTime + 0, pack_int16(2020))
-    machine.memory.write(lpSystemTime + 2, pack_int16(1))
-    machine.memory.write(lpSystemTime + 4, pack_int16(1))
-    machine.memory.write(lpSystemTime + 6, pack_int16(3))
-    machine.memory.write(lpSystemTime + 8, pack_int16(0))
-    machine.memory.write(lpSystemTime + 10, pack_int16(0))
-    machine.memory.write(lpSystemTime + 12, pack_int16(0))
-    machine.memory.write(lpSystemTime + 14, pack_int16(0x361))
-    log(machine, "GetSystemTime(%#x) (2020-01-01 00:00:00)" % lpSystemTime.value)
+    lpSystemTime = u.reg_read(UC_X86_REG_RCX)
+    u.mem_write(lpSystemTime + 0, pack_int16(2020))
+    u.mem_write(lpSystemTime + 2, pack_int16(1))
+    u.mem_write(lpSystemTime + 4, pack_int16(1))
+    u.mem_write(lpSystemTime + 6, pack_int16(3))
+    u.mem_write(lpSystemTime + 8, pack_int16(0))
+    u.mem_write(lpSystemTime + 10, pack_int16(0))
+    u.mem_write(lpSystemTime + 12, pack_int16(0))
+    u.mem_write(lpSystemTime + 14, pack_int16(0))
+    log(u, "GetSystemTime(%#x) (2020-01-01 00:00:00)" % lpSystemTime)
 
-def GetFileTime(machine):
+def GetFileTime(u: Uc):
     # BOOL GetFileTime( HANDLE hFile, LPFILETIME lpCreationTime, LPFILETIME lpLastAccessTime, LPFILETIME lpLastWriteTime );
-    hFile = machine.cpu.state.rcx
-    lpCreationTime = machine.cpu.state.rdx
-    lpLastAccessTime = machine.cpu.state.r8
-    lpLastWriteTime = machine.cpu.state.r9
-    if hFile.value & 0x10000:
+    hFile = u.reg_read(UC_X86_REG_RCX)
+    lpCreationTime = u.reg_read(UC_X86_REG_RDX)
+    lpLastAccessTime = u.reg_read(UC_X86_REG_R8)
+    lpLastWriteTime = u.reg_read(UC_X86_REG_R9)
+    if hFile & 0x10000:
         raise NotImplementedError
-    elif hFile.value & 0x40000:
-        filename = dir_handles[hFile.value % 0x40000]
+    elif hFile & 0x40000:
+        filename = dir_handles[hFile % 0x40000]
     else:
         raise ValueError
-    if lpCreationTime.value:
-        machine.memory.write(lpCreationTime, bytes.fromhex("d021055936c0d501"))
-    if lpLastAccessTime.value:
+    if lpCreationTime:
+        u.mem_write(lpCreationTime, bytes.fromhex("d021055936c0d501"))
+    if lpLastAccessTime:
         raise NotImplementedError
-    if lpLastWriteTime.value:
+    if lpLastWriteTime:
         raise NotImplementedError
-    machine.cpu.state.rax.value = 1
-    log(machine, "GetFileTime(%#x(\"%s\"), %#x, %#x, %#x) => %d" % (
-        hFile.value, filename, lpCreationTime.value, lpLastAccessTime.value, lpLastWriteTime.value,
-        machine.cpu.state.rax.value
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "GetFileTime(%#x(\"%s\"), %#x, %#x, %#x) => %d" % (
+        hFile, filename, lpCreationTime, lpLastAccessTime, lpLastWriteTime,
+        1
     ))
     error(0)
 
-def GetFullPathNameW(machine):
+def GetFullPathNameW(u: Uc):
     # DWORD GetFullPathNameW( LPCWSTR lpFileName, DWORD nBufferLength, LPWSTR lpBuffer, LPWSTR *lpFilePart );
-    lpFileName = machine.cpu.state.rcx
-    nBufferLength = machine.cpu.state.rdx
-    lpBuffer = machine.cpu.state.r8
-    lpFilePart = machine.cpu.state.r9
-    wcslen(machine)
-    size = machine.cpu.state.rax.value
-    filename = machine.memory.read(lpFileName, size * 2).decode("utf-16le")
-    if len(filename) + 1 > nBufferLength.value:
+    lpFileName = u.reg_read(UC_X86_REG_RCX)
+    nBufferLength = u.reg_read(UC_X86_REG_RDX)
+    lpBuffer = u.reg_read(UC_X86_REG_R8)
+    lpFilePart = u.reg_read(UC_X86_REG_R9)
+    wcslen(u)
+    size = u.reg_read(UC_X86_REG_RAX)
+    filename = u.mem_read(lpFileName, size * 2).decode("utf-16le")
+    if len(filename) + 1 > nBufferLength:
         raise ValueError
     if os.path.isdir(filename):
-        machine.memory.write(lpBuffer, filename.encode("utf-16le") + b"\x00\x00")
-        if lpFilePart.value:
-            machine.memory.write(lpFilePart, b"\x00\x00")
-    machine.memory.write(lpBuffer, filename.encode("utf-16le") + b"\x00\x00")
-    if lpFilePart.value:
+        u.mem_write(lpBuffer, filename.encode("utf-16le") + b"\x00\x00")
+        if lpFilePart:
+            u.mem_write(lpFilePart, b"\x00\x00")
+    u.mem_write(lpBuffer, filename.encode("utf-16le") + b"\x00\x00")
+    if lpFilePart:
         if os.path.isdir(filename):
-            machine.memory.write(lpFilePart, pack_int64(0))
+            u.mem_write(lpFilePart, pack_int64(0))
         else:
             try:
                 pos = filename.rindex("/")
             except ValueError:
                 pos = filename.rindex("\\")
-            machine.memory.write(lpFilePart, pack_int64(lpBuffer.value + pos * 2 + 2))
+            u.mem_write(lpFilePart, pack_int64(lpBuffer + pos * 2 + 2))
     if "/" in filename:
-        machine.cpu.state.rax.value = len(filename.split("/")[:-1])
+        u.reg_write(UC_X86_REG_RAX, len(filename.split("/")[:-1]))
     else:
-        machine.cpu.state.rax.value = len(filename.split("\\")[:-1])
-    log(machine, "GetFullPathNameW(\"%s\", %d, %#x, %#x) => %d" % (
-        filename, nBufferLength.value, lpBuffer.value, lpFilePart.value, machine.cpu.state.rax.value
+        u.reg_write(UC_X86_REG_RAX, len(filename.split("\\")[:-1]))
+    log(u, "GetFullPathNameW(\"%s\", %d, %#x, %#x) => %d" % (
+        filename, nBufferLength, lpBuffer, lpFilePart, u.reg_read(UC_X86_REG_RAX)
     ))
     error(0)
 
-def VirtualAlloc(machine):
+def VirtualAlloc(u: Uc):
     # LPVOID VirtualAlloc( LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect );
-    lpAddress = machine.cpu.state.rcx
-    dwSize = machine.cpu.state.rdx
-    flAllocationType = machine.cpu.state.r8
-    flProtect = machine.cpu.state.r9
-    if lpAddress.value == 0:
-        res = machine.memory.alloc(dwSize.value)
+    lpAddress = u.reg_read(UC_X86_REG_RCX)
+    dwSize = u.reg_read(UC_X86_REG_RDX)
+    flAllocationType = u.reg_read(UC_X86_REG_R8)
+    flProtect = u.reg_read(UC_X86_REG_R9)
+    if not flAllocationType & 0x00001000:
+        raise NotImplementedError
+    if lpAddress == 0:
+        free_alloc = u.__getattribute__("free_alloc")
+        res = 0
+        size = dwSize
+        if size % 4096 != 0:
+            size = (size // 4096 + 1) * 4096
+        for block in free_alloc:
+            if block[1] >= size:
+                res = block[0]
+                free_alloc.append((block[0] + size, block[1] - size))
+                free_alloc.remove(block)
+                free_alloc.sort(key=lambda b: b[0])
+                break
     else:
         raise NotImplementedError
-    machine.cpu.state.rax.value = res
-    log(machine, "VirtualAlloc(%#x, %d, %#x, %#x) => %#x" % (
-        lpAddress.value, dwSize.value, flAllocationType.value, flProtect.value, machine.cpu.state.rax.value
+    u.reg_write(UC_X86_REG_RAX, res)
+    log(u, "VirtualAlloc(%#x, %d, %#x, %#x) => %#x" % (
+        lpAddress, dwSize, flAllocationType, flProtect, res
     ))
-    error(0)
+    if res == 0:
+        error(8)
+    else:
+        error(0)
 
 def VirtualFree(machine):
     # BOOL VirtualFree( LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType );
@@ -910,30 +971,30 @@ def CheckRemoteDebuggerPresent(machine):
     ))
     error(0)
 
-def WriteFile(machine):
+def WriteFile(u: Uc):
     # BOOL WriteFile( HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped );
-    hFile = machine.cpu.state.rcx
-    lpBuffer = machine.cpu.state.rdx
-    nNumberOfBytesToWrite = machine.cpu.state.r8
-    lpNumberOfBytesWritten = machine.cpu.state.r9
-    lpOverlapped = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
+    hFile = u.reg_read(UC_X86_REG_RCX)
+    lpBuffer = u.reg_read(UC_X86_REG_RDX)
+    nNumberOfBytesToWrite = u.reg_read(UC_X86_REG_R8)
+    lpNumberOfBytesWritten = u.reg_read(UC_X86_REG_R9)
+    lpOverlapped = read_stack_param(u, 0)
     if lpOverlapped != 0:
         raise NotImplementedError
-    data = machine.memory.read(lpBuffer, nNumberOfBytesToWrite.value)
-    if hFile.value == 1:
+    data = u.mem_read(lpBuffer, nNumberOfBytesToWrite)
+    if hFile == 1:
         file = sys.stdout
         file.write(data.decode())
-    elif hFile.value == 2:
+    elif hFile == 2:
         file = sys.stderr
         file.write(data.decode())
     else:
-        file = file_handles[hFile.value - 0x10000]
+        file = file_handles[hFile - 0x10000]
         file.write(data)
-    lpNumberOfBytesWritten.value = nNumberOfBytesToWrite.value
-    machine.cpu.state.rax.value = 1
-    log(machine, "WriteFile(%#x, \"%s\", %d, %#x, %#x) => %d" % (
-        hFile.value, data.decode(), nNumberOfBytesToWrite.value, lpNumberOfBytesWritten.value, lpOverlapped,
-        machine.cpu.state.rax.value
+    u.reg_write(UC_X86_REG_R9, nNumberOfBytesToWrite)
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "WriteFile(%#x, \"%s\", %d, %#x, %#x) => %d" % (
+        hFile, data.decode(), nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped,
+        u.reg_read(UC_X86_REG_RAX)
     ))
     error(0)
 
