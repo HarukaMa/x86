@@ -1,3 +1,1 @@
-0x19000ffd2 GetSystemTimeAsFileTime(0x12ff30)
-0x19000ffe0 GetCurrentThreadId() => 1
-0x19000ffec GetCurrentProcessId() => 1
+0x140001230 GetModuleHandleA("kernel32.dll") => 0x6e72656b

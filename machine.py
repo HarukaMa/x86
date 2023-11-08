@@ -2879,13 +2879,13 @@ class Machine:
                         op1 = op1.value + read_int8(data[2:3])
                         if rex_w:
                             tmp = read_uint64(memory.read(op1, 8))
-                            pack = pack_int64
+                            pack = pack_uint64
                             msb = 63
                         elif op_size_override:
                             raise NotImplementedError
                         else:
                             tmp = read_uint32(memory.read(op1, 4))
-                            pack = pack_int32
+                            pack = pack_uint32
                             msb = 31
                         value = tmp ^ op2.value
                         memory.write(op1, pack(value))

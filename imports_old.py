@@ -7,9 +7,6 @@ import time
 from io import SEEK_SET
 from typing import List, Dict, BinaryIO, Any, TextIO, Union
 
-from unicorn import Uc, UC_QUERY_ARCH, UC_MODE_64, UC_QUERY_MODE
-from unicorn.x86_const import UC_X86_REG_RCX, UC_X86_REG_RAX, UC_X86_REG_RSP
-
 from exc import Exited
 from utils import pack_int64, read_int32, pack_int32, read_int64, pack_int16, read_int16, pack_int8
 
@@ -38,11 +35,10 @@ lasterror = 0
 
 printf_re = re.compile(r"%(?P<flags>[-+ #0]*)(?P<width>\d+|\*)?(?:\.(?P<precision>\d+|\*))?(?P<length>hh|h|l|ll|j|z|t|L|I64)?(?P<specifier>[%csdioxXufFeEaAgGnp])")
 
-def log(u: Uc, s: str):
-    print(f"{hex(read_int64(u.mem_read(u.reg_read(UC_X86_REG_RSP), 8)))} {s}", file=log_file, flush=True)
+def log(machine, s: str):
+    print(f"{hex(read_int64(machine.memory.read(machine.cpu.state.rsp.value, 8)))} {s}", file=log_file, flush=True)
 
 def error(value: int):
-    # TODO: TEB lasterror
     global lasterror
     lasterror = value
 
@@ -116,29 +112,29 @@ def SetUnhandledExceptionFilter(machine):
     machine.cpu.state.rax.value = 0
     log(machine, "SetUnhandledExceptionFilter(%#x) => %d" % (lpTopLevelExceptionFilter.value, machine.cpu.state.rax.value))
 
-def GetModuleHandleA(u: Uc):
+def GetModuleHandleA(machine):
     # HMODULE GetModuleHandleA(LPCSTR lpModuleName)
-    lpModuleName = u.reg_read(UC_X86_REG_RCX)
-    strlen(u)
-    if lpModuleName == 0:
-        if u.query(UC_QUERY_MODE) == UC_MODE_64:
+    lpModuleName = machine.cpu.state.rcx
+    strlen(machine)
+    if lpModuleName.value == 0:
+        if machine.mode == 64:
             handle = 0x140000000
         else:
             handle = 0x400000
         buf = b"NULL"
     else:
-        size = u.reg_read(UC_X86_REG_RAX)
-        buf = u.mem_read(lpModuleName, size)
-        # if buf.decode().lower() == "ntdll.dll":
-        #     handle = 0x40000000
-        #     try:
-        #         machine.memory.map_file(open("ntdll.dll", "rb"), 0, 0x400, 0x40000000, 0x400, "ntdll.dll")
-        #     except MemoryError:
-        #         pass
-        # else:
-        handle = read_int32(buf[:4])
-    u.reg_write(UC_X86_REG_RAX, handle)
-    log(u, "GetModuleHandleA(\"%s\") => %#x" % (buf.decode(), handle))
+        size = machine.cpu.state.rax.value
+        buf = machine.memory.read(lpModuleName, size)
+        if buf.decode().lower() == "ntdll.dll":
+            handle = 0x40000000
+            try:
+                machine.memory.map_file(open("ntdll.dll", "rb"), 0, 0x400, 0x40000000, 0x400, "ntdll.dll")
+            except MemoryError:
+                pass
+        else:
+            handle = read_int32(buf[:4])
+    machine.cpu.state.rax.value = handle
+    log(machine, "GetModuleHandleA(\"%s\") => %#x" % (buf.decode(), handle))
     error(0)
 
 def GetModuleHandleW(machine):
@@ -1703,17 +1699,17 @@ def HeapSetInformation(machine):
 #     obj = machine.cpu.state.rcx
 #     log(machine, "~_Container_base12 STUB!!")
 #
-def strlen(u: Uc):
+def strlen(machine):
     # size_t strlen( const char *str )
-    _str = u.reg_read(UC_X86_REG_RCX)
+    _str = machine.cpu.state.rcx
     res = 0
     while True:
-        buf: bytearray = u.mem_read(_str + res, 8)
+        buf: bytearray = machine.memory.read(_str + res, 8)
         tmp = buf.find(b"\x00")
         if tmp == -1:
             res += 8
             continue
-        u.reg_write(UC_X86_REG_RAX, res + tmp)
+        machine.cpu.state.rax.value = res + tmp
         return
 
 def wcslen(machine):

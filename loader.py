@@ -1,8 +1,11 @@
 from io import SEEK_CUR, SEEK_SET
 from typing import Union
 
+from unicorn import Uc, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE
+from unicorn.x86_const import UC_X86_REG_RIP, UC_X86_REG_RSP
+
 from machine import Machine
-from utils import read_int32, read_int16, read_int64, pack_int64, pack_int32
+from utils import read_int32, read_int16, read_int64, pack_int64, pack_int32, pack_uint64
 
 winapi = [
     "advapi32.dll",
@@ -209,6 +212,162 @@ def load_pe64_dll(machine: Machine, file: str, func: Union[str, int], path):
             machine.cpu.dump()
     return dll_exports[file.lower()][func]
 
+def load_pe64_u(u: Uc, file: str, arguments=None):
+    if arguments is None:
+        arguments = []
+    exe = open(file, "rb")
+    assert exe.read(2) == b"MZ", "Non-EXE file!"
+    exe.seek(0x3c, SEEK_SET)
+    nt_header_offset = read_int32(exe.read(4))
+    assert nt_header_offset != 0, "Non-PE file - zero NT header offset!"
+    exe.seek(nt_header_offset, SEEK_SET)
+
+    assert exe.read(4) == b"PE\x00\x00", "Non-PE file - no signature!"
+    assert exe.read(2) == b"\x64\x86", "Non-64-bit exe file!"
+    section_count = read_int16(exe.read(2))
+    exe.seek(nt_header_offset + 0x14, SEEK_SET)
+    optional_header_size = read_int16(exe.read(2))
+    exe.seek(nt_header_offset + 0x24, SEEK_SET)
+    uninit_size = read_int32(exe.read(4))
+    ep = read_int32(exe.read(4))
+    exe.seek(4, SEEK_CUR)
+    base = read_int64(exe.read(8))
+
+    exe.seek(0x28, SEEK_CUR)
+    stack_reserve = read_int64(exe.read(8))
+    stack_commit = read_int64(exe.read(8))
+    heap_reserve = read_int64(exe.read(8))
+    heap_commit = read_int64(exe.read(8))
+    exe.seek(nt_header_offset + 0x18 + optional_header_size, SEEK_SET)
+
+    u.mem_map(0x10000, 0x10000, UC_PROT_READ | UC_PROT_WRITE) # internal
+    cmdline = f"{file}"
+    if arguments:
+        cmdline += " " + " ".join(arguments)
+    u.mem_write(0x10000, pack_uint64(0x10100))
+    u.mem_write(0x10010, pack_uint64(0x10300))
+    u.mem_write(0x10020, pack_uint64(0x10500))
+    u.mem_write(0x10030, pack_uint64(0x10700))
+    u.mem_write(0x10100, cmdline.encode() + b"\0")
+    u.mem_write(0x10300, cmdline.encode("utf-16le") + b"\0\0")
+    u.mem_write(0x10500, ' '.join(arguments).encode() + b"\0")
+    u.mem_write(0x10700, ' '.join(arguments).encode("utf-16le") + b"\0\0")
+    u.mem_write(0x1e8ce, b"\x0e")
+
+    u.mem_map(0x20000, 0x10000) # imports
+    u.mem_map(0x100000, stack_reserve, UC_PROT_READ | UC_PROT_WRITE) # stack
+    u.mem_map(0x10000000, heap_reserve, UC_PROT_READ | UC_PROT_WRITE) # heap
+
+    u.mem_map(0x0, 0x10000, UC_PROT_READ | UC_PROT_WRITE) # TEB
+    u.mem_write(0x8, pack_uint64(0x130000))
+    u.mem_write(0x10, pack_uint64(0x12d000))
+
+    for _ in range(section_count):
+        name = file.split("/")[-1] + ":" + exe.read(8).rstrip(b"\x00").decode()
+        virtual_size = read_int32(exe.read(4))
+        va = read_int32(exe.read(4))
+        size = read_int32(exe.read(4))
+        ptr = read_int32(exe.read(4))
+        if size == ptr == 0:
+            exe.seek(12, SEEK_CUR)
+            char = read_int32(exe.read(4))
+            if char & 0x00000080:
+                u.mem_map(base + va, uninit_size)
+        else:
+            u.mem_map(base + va, virtual_size)
+            pos = exe.tell()
+            exe.seek(ptr, SEEK_SET)
+            u.mem_write(base + va, exe.read(size))
+            exe.seek(pos, SEEK_SET)
+            exe.seek(16, SEEK_CUR)
+    u.__setattr__("base", base)
+    u.__setattr__("bases",{
+        file.split("/")[-1]: base
+    })
+
+    header_size = exe.tell()
+    pos = exe.tell()
+    u.mem_map(base, 0x1000, UC_PROT_READ | UC_PROT_WRITE)
+    exe.seek(0, SEEK_SET)
+    u.mem_write(base, exe.read(header_size))
+    exe.seek(pos, SEEK_SET)
+    exe.seek(nt_header_offset + 0x18 + optional_header_size - 0x78)
+    import_va = read_int32(exe.read(4))
+    exe.seek(0x0c, SEEK_CUR)
+    exception_va = read_int32(exe.read(4))
+    exception_size = read_int32(exe.read(4))
+    u.mem_write(0x11000, pack_uint64(exception_va))
+    u.mem_write(0x11008, pack_uint64(exception_size))
+    index = 0
+    global import_index
+    u.__setattr__("imports", [])
+    u.__setattr__("dynamic_imports", [])
+    while True:
+        first_thunk = read_int32(u.mem_read(base + import_va + index * 0x14 + 0x10, 4))
+        if first_thunk == 0:
+            break
+        start = base + read_int32(u.mem_read(base + import_va + index * 0x14 + 0xc, 4))
+        buffer = bytearray()
+        while True:
+            byte = u.mem_read(start, 1)[0]
+            if byte == 0:
+                break
+            buffer.append(byte)
+            start += 1
+        import_name = buffer.decode()
+        # import_name = memory.read(base + read_int32(memory.read(base + import_va + index * 0x14 + 0xc, 4)), 128).split(b"\x00")[0].decode()
+        index2 = 0
+        while True:
+            ilt_entry = read_int64(u.mem_read(base + first_thunk + index2 * 8, 8))
+            if ilt_entry == 0:
+                break
+            if ilt_entry & (1 << 63):
+                ordinal = ilt_entry & 0xffff
+                func_name = "%s_%s" % (import_name, ordinal)
+            else:
+                start = base + (ilt_entry & 0x7fffffff) + 2
+                buffer = bytearray()
+                while True:
+                    byte = u.mem_read(start, 1)[0]
+                    if byte == 0:
+                        break
+                    buffer.append(byte)
+                    start += 1
+                func_name = buffer.split(b"\x00")[0].decode()
+            dll_import = 0
+            if import_name.lower() not in winapi:
+                dll_import = load_pe64_dll(machine, import_name, func_name, "/".join(file.split("/")[:-1]))
+                if dll_import == -1:
+                    raise FileNotFoundError(f"{import_name} is not implemented, module file not found")
+                elif dll_import == 0:
+                    raise AttributeError(f"{func_name} is not exported by {import_name}")
+                memory.write(base + first_thunk + index2 * 8, pack_int64(dll_import))
+            elif func_name not in u.__getattribute__("imports"):
+                u.__getattribute__("imports").append(func_name)
+                u.mem_write(0x20000 + import_index * 8, pack_int64((len(u.__getattribute__("imports")) - 1) * 256 + 6))
+                u.mem_write(base + first_thunk + index2 * 8, pack_int64(0x20000 + import_index * 8))
+                import_index += 1
+                if func_name == "_acmdln":
+                    u.mem_write(base + first_thunk + index2 * 8, pack_int64(0x10000))
+                elif func_name == "_wcmdln":
+                    u.mem_write(base + first_thunk + index2 * 8, pack_int64(0x10010))
+                elif func_name == "__argc":
+                    u.mem_write(base + first_thunk + index2 * 8, pack_int64(len(arguments) + 1))
+                elif func_name == "__argv":
+                    u.mem_write(base + first_thunk + index2 * 8, pack_int64(0x10020))
+                elif func_name == "__wargv":
+                    u.mem_write(base + first_thunk + index2 * 8, pack_int64(0x10030))
+                elif func_name == "__initenv":
+                    u.mem_write(base + first_thunk + index2 * 8, pack_int64(0x10008))
+            else:
+                existing_index = u.__getattribute__("imports").index(func_name)
+                u.mem_write(base + first_thunk + index2 * 8, pack_int64(0x20000 + existing_index * 8))
+
+            index2 += 1
+        index += 1
+
+    u.reg_write(UC_X86_REG_RIP, base + ep)
+    u.reg_write(UC_X86_REG_RSP, 0x12ff58)
 
 def load_pe64(machine: Machine, file: str, arguments=None):
     if arguments is None:
@@ -241,7 +400,9 @@ def load_pe64(machine: Machine, file: str, arguments=None):
     memory = machine.memory
 
     memory.map(0x10000, 0x10000, "internal")
-    cmdline = f"{file} {' '.join(arguments)}"
+    cmdline = f"{file}"
+    if arguments:
+        cmdline += " " + " ".join(arguments)
     memory.write(0x10000, pack_int64(0x10100))
     memory.write(0x10010, pack_int64(0x10300))
     memory.write(0x10020, pack_int64(0x10500))
