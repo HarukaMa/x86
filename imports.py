@@ -12,9 +12,8 @@ from unicorn import Uc, UC_QUERY_ARCH, UC_MODE_64, UC_QUERY_MODE, UC_MEM_READ, U
 from unicorn.x86_const import UC_X86_REG_RCX, UC_X86_REG_RAX, UC_X86_REG_RSP, UC_X86_REG_RDX, UC_X86_REG_R8D, \
     UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_RIP
 
-from exc import Exited
 from utils import pack_int64, read_int32, pack_int32, read_int64, pack_int16, read_int16, pack_int8, read_uint64, \
-    read_uint32
+    read_uint32, pack_int128
 
 log_file = open("api_log.txt", "w")
 
@@ -38,6 +37,7 @@ fiber = 0
 threads: List[List[Any]] = [[]]
 thread = 0
 lasterror = 0
+dynamic_imports: dict[str, int] = {}
 
 printf_re = re.compile(r"%(?P<flags>[-+ #0]*)(?P<width>\d+|\*)?(?:\.(?P<precision>\d+|\*))?(?P<length>hh|h|l|ll|j|z|t|L|I64)?(?P<specifier>[%csdioxXufFeEaAgGnp])")
 
@@ -239,11 +239,16 @@ def GetProcAddress(u: Uc):
     if not found:
         log(u, f"NOT IMPLEMENTED {module} {proc}")
         # raise NotImplementedError
-    pos = len(u.__getattribute__("dynamic_imports"))
-    u.mem_write(0x30000 + pos * 8, pack_int64(pos * 256 + 7))
-    u.reg_write(UC_X86_REG_RAX, 0x30000 + pos * 8)
-    log(u, "GetProcAddress(\"%s\", \"%s\") => %#x" % (module, proc, 0x30000 + pos * 8))
-    u.__getattribute__("dynamic_imports").append(proc)
+    if proc in dynamic_imports:
+        handle = dynamic_imports[proc]
+    else:
+        pos = len(u.__getattribute__("dynamic_imports"))
+        handle = 0x30000 + pos * 8
+        u.mem_write(0x30000 + pos * 8, pack_int64(pos * 256 + 7))
+        u.__getattribute__("dynamic_imports").append(proc)
+        dynamic_imports[proc] = handle
+    u.reg_write(UC_X86_REG_RAX, handle)
+    log(u, "GetProcAddress(\"%s\", \"%s\") => %#x" % (module, proc, handle))
     error(0)
 
 mem_protect_u_w = {
@@ -377,6 +382,9 @@ def CreateFile(u: Uc, a: bool):
             dir_handles[next_dir_handle] = filename
             next_dir_handle += 1
             u.reg_write(UC_X86_REG_RAX, handle)
+            log(u, f"{function_name}(\"{filename}\", {dwDesiredAccess:#x}, {dwShareMode}, "
+                   f"{lpSecurityAttributes}, {dwCreationDisposition}, {dwFlagsAndAttributes}, "
+                   f"{hTemplateFile}) => {u.reg_read(UC_X86_REG_RAX):#x}")
             return
     global next_file_handle
     handle = next_file_handle + 0x10000
@@ -436,8 +444,8 @@ def CreateFile(u: Uc, a: bool):
     else:
         u.reg_write(UC_X86_REG_RAX, -1)
     log(u, f"{function_name}(\"{filename}\", {dwDesiredAccess:#x}, {dwShareMode}, "
-    f"{lpSecurityAttributes}, {dwCreationDisposition}, {dwFlagsAndAttributes}, "
-    f"{hTemplateFile}) => {u.reg_read(UC_X86_REG_RAX):#x}")
+           f"{lpSecurityAttributes}, {dwCreationDisposition}, {dwFlagsAndAttributes}, "
+           f"{hTemplateFile}) => {u.reg_read(UC_X86_REG_RAX):#x}")
     error(err)
 
 def CreateFileW(u: Uc):
@@ -721,15 +729,15 @@ def IsDebuggerPresent(u: Uc):
 def GetLocalTime(u: Uc):
     # void GetLocalTime( LPSYSTEMTIME lpSystemTime );
     lpSystemTime = u.reg_read(UC_X86_REG_RCX)
-    u.mem_write(lpSystemTime + 0, pack_int16(1970))
+    u.mem_write(lpSystemTime + 0, pack_int16(2023))
     u.mem_write(lpSystemTime + 2, pack_int16(1))
-    u.mem_write(lpSystemTime + 4, pack_int16(1))
-    u.mem_write(lpSystemTime + 6, pack_int16(4))
-    u.mem_write(lpSystemTime + 8, pack_int16(0))
-    u.mem_write(lpSystemTime + 10, pack_int16(0))
-    u.mem_write(lpSystemTime + 12, pack_int16(0))
-    u.mem_write(lpSystemTime + 14, pack_int16(0))
-    log(u, "GetLocalTime(%#x) (1970-01-01 00:00:00)" % lpSystemTime)
+    u.mem_write(lpSystemTime + 4, pack_int16(0))
+    u.mem_write(lpSystemTime + 6, pack_int16(1))
+    u.mem_write(lpSystemTime + 8, pack_int16(21))
+    u.mem_write(lpSystemTime + 10, pack_int16(34))
+    u.mem_write(lpSystemTime + 12, pack_int16(56))
+    u.mem_write(lpSystemTime + 14, pack_int16(789))
+    log(u, "GetLocalTime(%#x) (2023-01-01 21:34:56.789)" % lpSystemTime)
 
 def SystemTimeToFileTime(u: Uc):
     # BOOL SystemTimeToFileTime( const SYSTEMTIME *lpSystemTime, LPFILETIME lpFileTime );
@@ -737,12 +745,12 @@ def SystemTimeToFileTime(u: Uc):
     lpFileTime = u.reg_read(UC_X86_REG_RDX)
     year = read_int16(u.mem_read(lpSystemTime + 0, 2))
     month = read_int16(u.mem_read(lpSystemTime + 2, 2))
-    day = read_int16(u.mem_read(lpSystemTime + 4, 2))
+    day = read_int16(u.mem_read(lpSystemTime + 6, 2))
     hour = read_int16(u.mem_read(lpSystemTime + 8, 2))
     minute = read_int16(u.mem_read(lpSystemTime + 10, 2))
     second = read_int16(u.mem_read(lpSystemTime + 12, 2))
     ms = read_int16(u.mem_read(lpSystemTime + 14, 2))
-    date = datetime.datetime(year, month, day, hour, minute, second, ms)
+    date = datetime.datetime(year, month, day, hour, minute, second, ms * 1000)
     u.mem_write(lpFileTime,
                 pack_int64(int((date - _FILETIME_null_date).total_seconds() * 10000000)))
     u.reg_write(UC_X86_REG_RAX, 1)
@@ -875,16 +883,17 @@ def GetVolumeInformationW(u: Uc):
 
 def GetSystemTime(u: Uc):
     # void GetSystemTime( LPSYSTEMTIME lpSystemTime );
+    # UTC
     lpSystemTime = u.reg_read(UC_X86_REG_RCX)
-    u.mem_write(lpSystemTime + 0, pack_int16(2020))
+    u.mem_write(lpSystemTime + 0, pack_int16(2023))
     u.mem_write(lpSystemTime + 2, pack_int16(1))
-    u.mem_write(lpSystemTime + 4, pack_int16(1))
-    u.mem_write(lpSystemTime + 6, pack_int16(3))
-    u.mem_write(lpSystemTime + 8, pack_int16(0))
-    u.mem_write(lpSystemTime + 10, pack_int16(0))
-    u.mem_write(lpSystemTime + 12, pack_int16(0))
-    u.mem_write(lpSystemTime + 14, pack_int16(0))
-    log(u, "GetSystemTime(%#x) (2020-01-01 00:00:00)" % lpSystemTime)
+    u.mem_write(lpSystemTime + 4, pack_int16(0))
+    u.mem_write(lpSystemTime + 6, pack_int16(1))
+    u.mem_write(lpSystemTime + 8, pack_int16(12))
+    u.mem_write(lpSystemTime + 10, pack_int16(34))
+    u.mem_write(lpSystemTime + 12, pack_int16(56))
+    u.mem_write(lpSystemTime + 14, pack_int16(789))
+    log(u, "GetSystemTime(%#x) (2023-01-01 12:34:56.789)" % lpSystemTime)
 
 def GetFileTime(u: Uc):
     # BOOL GetFileTime( HANDLE hFile, LPFILETIME lpCreationTime, LPFILETIME lpLastAccessTime, LPFILETIME lpLastWriteTime );
@@ -899,7 +908,7 @@ def GetFileTime(u: Uc):
     else:
         raise ValueError
     if lpCreationTime:
-        u.mem_write(lpCreationTime, bytes.fromhex("d021055936c0d501"))
+        u.mem_write(lpCreationTime, pack_int128(133170480000000000))
     if lpLastAccessTime:
         raise NotImplementedError
     if lpLastWriteTime:
