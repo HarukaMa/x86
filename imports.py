@@ -236,10 +236,11 @@ def GetModuleHandle(u: Uc, a: bool):
                         break
                 if do_map:
                     data = open("ntdll.dll", "rb").read()
-                    u.mem_map(0x40000000, 0x1000)
+                    u.mem_map(0x40000000, 0x100000)
                     u.mem_write(0x40000000, data)
             else:
                 handle = 0x60000000 + len(module_handles) * 0x100000
+                u.mem_map(handle, 0x100000)
             module_handles[name] = handle
     u.reg_write(UC_X86_REG_RAX, handle)
     log(u, "%s(\"%s\") => %#x" % (function_name, buf.decode() if a else buf.decode("utf-16le"), handle))
@@ -280,8 +281,9 @@ def GetProcAddress(u: Uc):
         handle = dynamic_imports[proc]
     else:
         pos = len(u.__getattribute__("dynamic_imports"))
-        handle = 0x30000 + pos * 8
-        u.mem_write(0x30000 + pos * 8, pack_int64(pos * 256 + 7))
+        module_handle = module_handles[module]
+        handle = module_handle + 0x1000 + 0x40 * pos
+        u.mem_write(handle, pack_int64(pos * 256 + 7))
         u.__getattribute__("dynamic_imports").append(proc)
         dynamic_imports[proc] = handle
     u.reg_write(UC_X86_REG_RAX, handle)
