@@ -239,7 +239,7 @@ def GetModuleHandle(u: Uc, a: bool):
                     u.mem_map(0x40000000, 0x1000)
                     u.mem_write(0x40000000, data)
             else:
-                handle = 0x80000000 + len(module_handles) * 0x100000
+                handle = 0x60000000 + len(module_handles) * 0x100000
             module_handles[name] = handle
     u.reg_write(UC_X86_REG_RAX, handle)
     log(u, "%s(\"%s\") => %#x" % (function_name, buf.decode() if a else buf.decode("utf-16le"), handle))
