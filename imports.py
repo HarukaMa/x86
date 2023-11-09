@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import time
+import random
 
 from io import SEEK_SET
 from typing import List, Dict, BinaryIO, Any, TextIO, Union, Optional
@@ -38,16 +39,54 @@ threads: List[List[Any]] = [[]]
 thread = 0
 lasterror = 0
 dynamic_imports: dict[str, int] = {}
+start_time = time.time()
+last_time = start_time
+module_handles: dict[str, int] = {}
 
 printf_re = re.compile(r"%(?P<flags>[-+ #0]*)(?P<width>\d+|\*)?(?:\.(?P<precision>\d+|\*))?(?P<length>hh|h|l|ll|j|z|t|L|I64)?(?P<specifier>[%csdioxXufFeEaAgGnp])")
 
 def log(u: Uc, s: str):
-    print(f"{hex(read_int64(u.mem_read(u.reg_read(UC_X86_REG_RSP), 8)))} {s}", file=log_file, flush=True)
+    print(f"{datetime.datetime.now()} {hex(read_int64(u.mem_read(u.reg_read(UC_X86_REG_RSP), 8)))} {s}", file=log_file, flush=True)
 
 def error(value: int):
     # TODO: TEB lasterror
     global lasterror
     lasterror = value
+
+def epoch_to_filetime(epoch: float) -> int:
+    return int(epoch * 10000000 + 116444736000000000)
+
+def filetime_to_epoch(filetime: int) -> float:
+    return (filetime - 116444736000000000) / 10000000
+
+def write_systemtime(u: Uc, addr: int, utc: bool, start: bool):
+    # typedef struct _SYSTEMTIME {
+    #   WORD wYear;
+    #   WORD wMonth;
+    #   WORD wDayOfWeek;
+    #   WORD wDay;
+    #   WORD wHour;
+    #   WORD wMinute;
+    #   WORD wSecond;
+    #   WORD wMilliseconds;
+    # } SYSTEMTIME, *PSYSTEMTIME;
+    global last_time
+    if not start:
+        date = datetime.datetime.utcfromtimestamp(last_time)
+    else:
+        date = datetime.datetime.utcfromtimestamp(start_time)
+    if not utc:
+        date = date.replace(tzinfo=datetime.timezone.utc).astimezone()
+    u.mem_write(addr, pack_int16(date.year))
+    u.mem_write(addr + 2, pack_int16(date.month))
+    u.mem_write(addr + 4, pack_int16(date.weekday()))
+    u.mem_write(addr + 6, pack_int16(date.day))
+    u.mem_write(addr + 8, pack_int16(date.hour))
+    u.mem_write(addr + 10, pack_int16(date.minute))
+    u.mem_write(addr + 12, pack_int16(date.second))
+    u.mem_write(addr + 14, pack_int16(date.microsecond // 1000))
+    last_time += random.randint(10, 1000) / 1000000
+    return date
 
 def read_stack_param(u: Uc, index: int):
     if u.query(UC_QUERY_MODE) == UC_MODE_64:
@@ -165,66 +204,64 @@ def SetUnhandledExceptionFilter(machine):
     machine.cpu.state.rax.value = 0
     log(machine, "SetUnhandledExceptionFilter(%#x) => %d" % (lpTopLevelExceptionFilter.value, machine.cpu.state.rax.value))
 
-def GetModuleHandleA(u: Uc):
-    # HMODULE GetModuleHandleA(LPCSTR lpModuleName)
+def GetModuleHandle(u: Uc, a: bool):
+    function_name = "GetModuleHandleA" if a else "GetModuleHandleW"
     lpModuleName = u.reg_read(UC_X86_REG_RCX)
-    strlen(u)
+    if a:
+        strlen(u)
+    else:
+        wcslen(u)
     if lpModuleName == 0:
         if u.query(UC_QUERY_MODE) == UC_MODE_64:
             handle = 0x140000000
         else:
             handle = 0x400000
-        buf = b"NULL"
+        if a:
+            buf = b"NULL"
+        else:
+            buf = "NULL".encode("utf-16le")
     else:
         size = u.reg_read(UC_X86_REG_RAX)
         buf = u.mem_read(lpModuleName, size)
-        if buf.decode().lower() == "ntdll.dll":
-            handle = 0x40000000
-            do_map = True
-            for mem in u.mem_regions():
-                if mem[0] <= 0x40000000 <= mem[1]:
-                    do_map = False
-                    break
-            if do_map:
-                data = open("ntdll.dll", "rb").read()
-                u.mem_map(0x40000000, 0x1000)
-                u.mem_write(0x40000000, data)
+        name = (buf.decode() if a else buf.decode("utf-16le")).lower()
+        if name in module_handles:
+            handle = module_handles[name]
         else:
-            handle = read_int32(buf[:4])
+            if name == "ntdll.dll":
+                handle = 0x40000000
+                do_map = True
+                for mem in u.mem_regions():
+                    if mem[0] <= 0x40000000 <= mem[1]:
+                        do_map = False
+                        break
+                if do_map:
+                    data = open("ntdll.dll", "rb").read()
+                    u.mem_map(0x40000000, 0x1000)
+                    u.mem_write(0x40000000, data)
+            else:
+                handle = 0x80000000 + len(module_handles) * 0x100000
+            module_handles[name] = handle
     u.reg_write(UC_X86_REG_RAX, handle)
-    log(u, "GetModuleHandleA(\"%s\") => %#x" % (buf.decode(), handle))
+    log(u, "%s(\"%s\") => %#x" % (function_name, buf.decode() if a else buf.decode("utf-16le"), handle))
     error(0)
 
-def GetModuleHandleW(machine):
+def GetModuleHandleA(u: Uc):
+    # HMODULE GetModuleHandleA(LPCSTR lpModuleName)
+    return GetModuleHandle(u, True)
+
+def GetModuleHandleW(u: Uc):
     # HMODULE GetModuleHandleW(LPCWSTR lpModuleName)
-    lpModuleName = machine.cpu.state.rcx
-    wcslen(machine)
-    if lpModuleName.value == 0:
-        if machine.mode == 64:
-            handle = 0x140000000
-        else:
-            handle = 0x400000
-        buf = b"N\x00U\x00L\x00L\x00"
-    else:
-        size = machine.cpu.state.rax.value
-        buf = machine.memory.read(lpModuleName, size * 2)
-        if buf.decode("utf-16le").lower() == "ntdll.dll":
-            handle = 0x40000000
-            try:
-                machine.memory.map_file(open("ntdll.dll", "rb"), 0, 0x400, 0x40000000, 0x400, "ntdll.dll")
-            except MemoryError:
-                pass
-        else:
-            handle = read_int32(buf[:8:2])
-    machine.cpu.state.rax.value = handle
-    log(machine, "GetModuleHandleW(\"%s\") => %#x" % (buf.decode("utf-16le"), handle))
-    error(0)
+    return GetModuleHandle(u, False)
 
 def GetProcAddress(u: Uc):
     # FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
     hModule = u.reg_read(UC_X86_REG_RCX)
     lpProcName = u.reg_read(UC_X86_REG_RDX)
-    module = pack_int32(hModule).decode()
+    module = "UNKNOWN"
+    for k, v in module_handles.items():
+        if v == hModule:
+            module = k
+            break
     tmp = u.reg_read(UC_X86_REG_RCX)
     u.reg_write(UC_X86_REG_RCX, lpProcName)
     strlen(u)
@@ -729,15 +766,8 @@ def IsDebuggerPresent(u: Uc):
 def GetLocalTime(u: Uc):
     # void GetLocalTime( LPSYSTEMTIME lpSystemTime );
     lpSystemTime = u.reg_read(UC_X86_REG_RCX)
-    u.mem_write(lpSystemTime + 0, pack_int16(2023))
-    u.mem_write(lpSystemTime + 2, pack_int16(1))
-    u.mem_write(lpSystemTime + 4, pack_int16(0))
-    u.mem_write(lpSystemTime + 6, pack_int16(1))
-    u.mem_write(lpSystemTime + 8, pack_int16(21))
-    u.mem_write(lpSystemTime + 10, pack_int16(34))
-    u.mem_write(lpSystemTime + 12, pack_int16(56))
-    u.mem_write(lpSystemTime + 14, pack_int16(789))
-    log(u, "GetLocalTime(%#x) (2023-01-01 21:34:56.789)" % lpSystemTime)
+    date = write_systemtime(u, lpSystemTime, False, False)
+    log(u, "GetLocalTime(%#x) (%s)" % (lpSystemTime, date))
 
 def SystemTimeToFileTime(u: Uc):
     # BOOL SystemTimeToFileTime( const SYSTEMTIME *lpSystemTime, LPFILETIME lpFileTime );
@@ -885,15 +915,8 @@ def GetSystemTime(u: Uc):
     # void GetSystemTime( LPSYSTEMTIME lpSystemTime );
     # UTC
     lpSystemTime = u.reg_read(UC_X86_REG_RCX)
-    u.mem_write(lpSystemTime + 0, pack_int16(2023))
-    u.mem_write(lpSystemTime + 2, pack_int16(1))
-    u.mem_write(lpSystemTime + 4, pack_int16(0))
-    u.mem_write(lpSystemTime + 6, pack_int16(1))
-    u.mem_write(lpSystemTime + 8, pack_int16(12))
-    u.mem_write(lpSystemTime + 10, pack_int16(34))
-    u.mem_write(lpSystemTime + 12, pack_int16(56))
-    u.mem_write(lpSystemTime + 14, pack_int16(789))
-    log(u, "GetSystemTime(%#x) (2023-01-01 12:34:56.789)" % lpSystemTime)
+    date = write_systemtime(u, lpSystemTime, True, False)
+    log(u, "GetSystemTime(%#x) (%s)" % (lpSystemTime, date))
 
 def GetFileTime(u: Uc):
     # BOOL GetFileTime( HANDLE hFile, LPFILETIME lpCreationTime, LPFILETIME lpLastAccessTime, LPFILETIME lpLastWriteTime );
@@ -908,7 +931,8 @@ def GetFileTime(u: Uc):
     else:
         raise ValueError
     if lpCreationTime:
-        u.mem_write(lpCreationTime, pack_int128(133170480000000000))
+        u.mem_write(lpCreationTime, pack_int128(epoch_to_filetime(start_time - 3600)))
+        # u.mem_write(lpCreationTime, pack_int128(133170480000000000))
     if lpLastAccessTime:
         raise NotImplementedError
     if lpLastWriteTime:

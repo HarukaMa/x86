@@ -4,7 +4,7 @@ import time
 
 import capstone
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE, UcError, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_INVALID, \
-    UC_ERR_EXCEPTION, UC_HOOK_INSN
+    UC_ERR_EXCEPTION, UC_HOOK_INSN, UC_HOOK_MEM_READ, UC_HOOK_MEM_VALID
 from unicorn.x86_const import UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RDI, \
     UC_X86_REG_RSI, UC_X86_REG_RBP, UC_X86_REG_RSP, UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_R10, UC_X86_REG_R11, \
     UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15, UC_X86_REG_XMM0, UC_X86_REG_XMM1, UC_X86_REG_XMM2, \
@@ -214,7 +214,7 @@ def main():
     def h(_, access, address, size, value, user_data):
         print(f"access {address:#x}")
         return True
-    u.hook_add(UC_HOOK_MEM_INVALID, h)
+    u.hook_add(UC_HOOK_MEM_VALID, h, begin=0, end=0x10000)
     def c(_, user_data):
         print(f"syscall {address:#x}")
         return True
