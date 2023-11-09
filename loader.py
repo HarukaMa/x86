@@ -5,7 +5,8 @@ from unicorn import Uc, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE
 from unicorn.x86_const import UC_X86_REG_RIP, UC_X86_REG_RSP
 
 from machine import Machine
-from utils import read_int32, read_int16, read_int64, pack_int64, pack_int32, pack_uint64, pack_uint16
+from utils import read_int32, read_int16, read_int64, pack_int64, pack_int32, pack_uint64, pack_uint16, pack_uint8, \
+    pack_uint32
 
 winapi = [
     "advapi32.dll",
@@ -266,11 +267,16 @@ def load_pe64_u(u: Uc, file: str, arguments=None):
     u.mem_write(0x10, pack_uint64(0x12d000))
     u.mem_write(0x38, pack_uint64(0x8100))
     u.mem_write(0x40, pack_uint64(0x8000))
+    u.mem_write(0x60, pack_uint64(0x2000))
     u.mem_write(0x8000, pack_uint16(0x100))
+    # debug port
+    u.mem_write(0x8100, pack_uint32(0))
 
     for _ in range(section_count):
         name = file.split("/")[-1] + ":" + exe.read(8).rstrip(b"\x00").decode()
         virtual_size = read_int32(exe.read(4))
+        if virtual_size % 0x1000 != 0:
+            virtual_size = (virtual_size // 0x1000 + 1) * 0x1000
         va = read_int32(exe.read(4))
         size = read_int32(exe.read(4))
         ptr = read_int32(exe.read(4))

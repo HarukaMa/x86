@@ -1,5 +1,7 @@
+import datetime
 import sys
-from typing import Optional
+from io import StringIO
+from typing import Optional, TextIO
 import time
 
 import capstone
@@ -82,7 +84,8 @@ def main():
     load_pe64_u(u, sys.argv[1])
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     debug_start: Optional[int] = None
-    machine = Machine(debug_start=debug_start, trace_start=None)
+    trace_start: Optional[int] = None
+    machine = Machine(debug_start=debug_start, trace_start=trace_start)
     load_pe64(machine, sys.argv[1])
     # load_pe32(machine, "/Users/MrX/Downloads/chuniApp_c+_origin.exe")
     # load_pe64(machine, "/Users/MrX/Downloads/amdaemon.exe")
@@ -93,24 +96,34 @@ def main():
 
     inst_count = 0
     timer = time.perf_counter_ns()
+    debug = False
+    trace = False
+    trace_file: Optional[TextIO] = None
 
     def hook_all(uc, address, size, _):
-        nonlocal inst_count, timer
+        nonlocal inst_count, timer, debug, trace, trace_file
+        u.__setattr__("inst_count", inst_count)
         if inst_count != 0 and inst_count % 100000 == 0:
             now = time.perf_counter_ns()
-            print(f"{inst_count} ({(now - timer) / 100000} ns per inst)")
+            print(f"{datetime.datetime.now()} {inst_count} ({(now - timer) / 100000} ns per inst)")
             timer = now
-        debug = False
         if debug_start is not None and inst_count >= debug_start:
             debug = True
             dump(uc)
+        if trace_start is not None and inst_count >= trace_start:
+            trace = True
+            if not trace_file:
+                trace_file = open(f"trace_{inst_count}.txt", "w")
 
         data = uc.mem_read(address, 20)
 
-        if debug:
+        if debug or trace:
             try:
                 inst = next(md.disasm(data, address))
-                print("%d\t%#x  %s %s" % (inst_count, inst.address, inst.mnemonic, inst.op_str))
+                if debug:
+                    print("%d\t%#x  %s %s" % (inst_count, inst.address, inst.mnemonic, inst.op_str))
+                if trace:
+                    trace_file.write("%d\t%#x  %s %s\n" % (inst_count, inst.address, inst.mnemonic, inst.op_str))
             except:
                 if data[0] == 0x06:
                     s = "%#x  import handler %s"
@@ -120,7 +133,10 @@ def main():
                     i = u.__getattribute__("dynamic_imports")[read_int32(data[1:5])]
                 else:
                     raise NotImplementedError
-                print(s % (address, i))
+                if debug:
+                    print(s % (address, i))
+                if trace:
+                    trace_file.write(f"{s}\n" % (address, i))
 
         if data[0] in (0x06, 0x07):
             if data[0] == 0x06:
@@ -211,11 +227,19 @@ def main():
         u.reg_write(UC_X86_REG_RIP, read_uint64(u.mem_read(context + 0xf8, 8)))
 
     u.hook_add(UC_HOOK_CODE, hook_all)
-    def h(_, access, address, size, value, user_data):
-        print(f"access {address:#x}")
+    def i(_, access, address, size, value, __):
+        print(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} invalid {access} {address:#x} {size} {value}")
+        return True
+    u.hook_add(UC_HOOK_MEM_INVALID, i)
+    def h(_, access, address, size, value, __):
+        print(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} access {access} {address:#x} {size} {value}")
         return True
     u.hook_add(UC_HOOK_MEM_VALID, h, begin=0, end=0x10000)
-    def c(_, user_data):
+    def n(_, access, address, size, value, __):
+        print(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} ntdll {access} {address:#x} {size} {value}")
+        return True
+    u.hook_add(UC_HOOK_MEM_VALID, n, begin=0x40000000, end=0x40100000)
+    def c(_, __):
         print(f"syscall {address:#x}")
         return True
     u.hook_add(UC_HOOK_INSN, c, arg1=UC_X86_INS_SYSCALL)

@@ -14,7 +14,7 @@ from unicorn.x86_const import UC_X86_REG_RCX, UC_X86_REG_RAX, UC_X86_REG_RSP, UC
     UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_RIP
 
 from utils import pack_int64, read_int32, pack_int32, read_int64, pack_int16, read_int16, pack_int8, read_uint64, \
-    read_uint32, pack_int128
+    read_uint32, pack_int128, pack_uint64, pack_uint32
 
 log_file = open("api_log.txt", "w")
 
@@ -42,11 +42,12 @@ dynamic_imports: dict[str, int] = {}
 start_time = time.time()
 last_time = start_time
 module_handles: dict[str, int] = {}
+valloc_size: dict[int, int] = {}
 
 printf_re = re.compile(r"%(?P<flags>[-+ #0]*)(?P<width>\d+|\*)?(?:\.(?P<precision>\d+|\*))?(?P<length>hh|h|l|ll|j|z|t|L|I64)?(?P<specifier>[%csdioxXufFeEaAgGnp])")
 
 def log(u: Uc, s: str):
-    print(f"{datetime.datetime.now()} {hex(read_int64(u.mem_read(u.reg_read(UC_X86_REG_RSP), 8)))} {s}", file=log_file, flush=True)
+    print(f"{datetime.datetime.now()} {u.__getattribute__('inst_count')} {hex(read_int64(u.mem_read(u.reg_read(UC_X86_REG_RSP), 8)))} {s}", file=log_file, flush=True)
 
 def error(value: int):
     # TODO: TEB lasterror
@@ -106,12 +107,13 @@ def alloc_memory(alloc_list: list[tuple[int, int]], size: int) -> Optional[int]:
             return res
     return None
 
-def enlarge_memory(alloc_list: list[tuple[int, int]], size):
+def enlarge_memory(u: Uc, alloc_list: list[tuple[int, int]], size):
     blocks = size // 0x100000 + 1
     last_block = alloc_list[-1]
     last_address = last_block[0] + last_block[1]
     alloc_list.remove(last_block)
     alloc_list.append((last_block[0], last_block[1] + 0x100000 * blocks))
+    u.mem_map(last_address, 0x100000 * blocks)
 
 def dealloc_memory(alloc_list: list[tuple[int, int]], start: int, size: int):
     if start % 4096 != 0:
@@ -134,21 +136,21 @@ def dealloc_memory(alloc_list: list[tuple[int, int]], start: int, size: int):
     for block in d:
         alloc_list.remove(block)
 
-def GetSystemTimeAsFileTime(machine):
+def GetSystemTimeAsFileTime(u: Uc):
     # void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
-    lpSystemTimeAsFileTime = machine.cpu.state.rcx
-    machine.memory.write(lpSystemTimeAsFileTime, pack_int64(int((datetime.datetime.utcnow() - _FILETIME_null_date).total_seconds() * 10000000)))
-    log(machine, "GetSystemTimeAsFileTime(%#x)" % lpSystemTimeAsFileTime.value)
+    lpSystemTimeAsFileTime = u.reg_read(UC_X86_REG_RCX)
+    u.mem_write(lpSystemTimeAsFileTime, pack_int64(epoch_to_filetime(time.time())))
+    log(u, "GetSystemTimeAsFileTime(%#x)" % lpSystemTimeAsFileTime)
 
-def GetCurrentProcessId(machine):
+def GetCurrentProcessId(u: Uc):
     # DWORD GetCurrentProcessId()
-    machine.cpu.state.rax.value = 1
-    log(machine, "GetCurrentProcessId() => %d" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, 0x100)
+    log(u, "GetCurrentProcessId() => %d" % u.reg_read(UC_X86_REG_RAX))
 
-def GetCurrentThreadId(machine):
+def GetCurrentThreadId(u: Uc):
     # DWORD GetCurrentThreadId()
-    machine.cpu.state.rax.value = 1
-    log(machine, "GetCurrentThreadId() => %d" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, 0x100)
+    log(u, "GetCurrentThreadId() => %d" % u.reg_read(UC_X86_REG_RAX))
 
 def GetCurrentThread(machine):
     # HANDLE GetCurrentThread();
@@ -179,14 +181,14 @@ def GetTickCount(machine):
     machine.cpu.state.rax.value = 3600000
     log(machine, "GetTickCount() => %d" % machine.cpu.state.rax.value)
 
-def QueryPerformanceCounter(machine):
+def QueryPerformanceCounter(u: Uc):
     # BOOL QueryPerformanceCounter(LARGE_INTEGER *lpPerformanceCount)
-    lpPerformanceCount = machine.cpu.state.rcx
+    lpPerformanceCount = u.reg_read(UC_X86_REG_RCX)
     now = int(time.time() * 10000000)
-    machine.memory.write(lpPerformanceCount, pack_int64(now))
-    machine.cpu.state.rax.value = 1
-    log(machine, "QueryPerformanceCounter(%#x) => %d (%d)" % (
-        lpPerformanceCount.value, machine.cpu.state.rax.value, now
+    u.mem_write(lpPerformanceCount, pack_int64(now))
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "QueryPerformanceCounter(%#x) => %d (%d)" % (
+        lpPerformanceCount, u.reg_read(UC_X86_REG_RAX), now
     ))
     error(0)
 
@@ -198,19 +200,17 @@ def QueryPerformanceFrequency(machine):
     log(machine, "QueryPerformanceFrequency(%#x) => %d" % (lpFrequency.value, machine.cpu.state.rax.value))
     error(0)
 
-def SetUnhandledExceptionFilter(machine):
+def SetUnhandledExceptionFilter(u: Uc):
     # LPTOP_LEVEL_EXCEPTION_FILTER __stdcall SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER lpTopLevelExceptionFilter)
-    lpTopLevelExceptionFilter = machine.cpu.state.rcx
-    machine.cpu.state.rax.value = 0
-    log(machine, "SetUnhandledExceptionFilter(%#x) => %d" % (lpTopLevelExceptionFilter.value, machine.cpu.state.rax.value))
+    lpTopLevelExceptionFilter = u.reg_read(UC_X86_REG_RCX)
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "SetUnhandledExceptionFilter(%#x) => %d" % (lpTopLevelExceptionFilter, 0))
 
-def GetModuleHandle(u: Uc, a: bool):
-    function_name = "GetModuleHandleA" if a else "GetModuleHandleW"
-    lpModuleName = u.reg_read(UC_X86_REG_RCX)
-    if a:
-        strlen(u)
+def GetModuleHandle(u: Uc, a: bool, ex: bool, lpModuleName, dwFlags, phModule):
+    if ex:
+        function_name = "GetModuleHandleExA" if a else "GetModuleHandleExW"
     else:
-        wcslen(u)
+        function_name = "GetModuleHandleA" if a else "GetModuleHandleW"
     if lpModuleName == 0:
         if u.query(UC_QUERY_MODE) == UC_MODE_64:
             handle = 0x140000000
@@ -221,7 +221,14 @@ def GetModuleHandle(u: Uc, a: bool):
         else:
             buf = "NULL".encode("utf-16le")
     else:
-        size = u.reg_read(UC_X86_REG_RAX)
+        tmp = u.reg_read(UC_X86_REG_RCX)
+        u.reg_write(UC_X86_REG_RCX, lpModuleName)
+        if a:
+            strlen(u)
+        else:
+            wcslen(u)
+        u.reg_write(UC_X86_REG_RCX, tmp)
+        size = u.reg_read(UC_X86_REG_RAX) * (1 if a else 2)
         buf = u.mem_read(lpModuleName, size)
         name = (buf.decode() if a else buf.decode("utf-16le")).lower()
         if name in module_handles:
@@ -242,17 +249,36 @@ def GetModuleHandle(u: Uc, a: bool):
                 handle = 0x60000000 + len(module_handles) * 0x100000
                 u.mem_map(handle, 0x100000)
             module_handles[name] = handle
-    u.reg_write(UC_X86_REG_RAX, handle)
-    log(u, "%s(\"%s\") => %#x" % (function_name, buf.decode() if a else buf.decode("utf-16le"), handle))
+    if ex:
+        u.mem_write(phModule, pack_int64(handle))
+        u.reg_write(UC_X86_REG_RAX, 1)
+        log(u, f"{function_name}({dwFlags:#x}, \"{buf.decode()}\", {phModule:#x}) => 1 ({handle:#x})")
+    else:
+        u.reg_write(UC_X86_REG_RAX, handle)
+        log(u, f"{function_name}(\"{buf.decode()}\") => {handle:#x}")
     error(0)
 
 def GetModuleHandleA(u: Uc):
     # HMODULE GetModuleHandleA(LPCSTR lpModuleName)
-    return GetModuleHandle(u, True)
+    return GetModuleHandle(u, True, False,  u.reg_read(UC_X86_REG_RCX), 0, 0)
 
 def GetModuleHandleW(u: Uc):
     # HMODULE GetModuleHandleW(LPCWSTR lpModuleName)
-    return GetModuleHandle(u, False)
+    return GetModuleHandle(u, False, False, u.reg_read(UC_X86_REG_RCX), 0, 0)
+
+def GetModuleHandleExA(u: Uc):
+    # BOOL GetModuleHandleExA( DWORD dwFlags, LPCSTR lpModuleName, HMODULE *phModule );
+    dwFlags = u.reg_read(UC_X86_REG_RCX)
+    lpModuleName = u.reg_read(UC_X86_REG_RDX)
+    phModule = u.reg_read(UC_X86_REG_R8)
+    return GetModuleHandle(u, True, True, lpModuleName, dwFlags, phModule)
+
+def GetModuleHandleExW(u: Uc):
+    # BOOL GetModuleHandleExW( DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule );
+    dwFlags = u.reg_read(UC_X86_REG_RCX)
+    lpModuleName = u.reg_read(UC_X86_REG_RDX)
+    phModule = u.reg_read(UC_X86_REG_R8)
+    return GetModuleHandle(u, False, True, lpModuleName, dwFlags, phModule)
 
 def GetProcAddress(u: Uc):
     # FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
@@ -719,28 +745,53 @@ def Beep(machine):
     log(machine, "Beep(%d, %d) => %d" % (dwFreq.value, dwDuration.value, machine.cpu.state.rax.value))
     error(0)
 
+def LoadLibrary(u: Uc, a: bool, ex: bool, hFile, dwFlags):
+    if a:
+        function_name = "LoadLibraryExA" if ex else "LoadLibraryA"
+    else:
+        function_name = "LoadLibraryExW" if ex else "LoadLibraryW"
+    lpLibFileName = u.reg_read(UC_X86_REG_RCX)
+    hFile = u.reg_read(UC_X86_REG_RDX)
+    dwFlags = u.reg_read(UC_X86_REG_R8)
+    if a:
+        strlen(u)
+    else:
+        wcslen(u)
+    size = u.reg_read(UC_X86_REG_RAX) * (1 if a else 2)
+    buffer = u.mem_read(lpLibFileName, size)
+    filename = buffer.decode() if a else buffer.decode("utf-16le")
+    if filename in module_handles:
+        handle = module_handles[filename]
+    else:
+        if filename == "ntdll.dll":
+            handle = 0x40000000
+            do_map = True
+            for mem in u.mem_regions():
+                if mem[0] <= 0x40000000 <= mem[1]:
+                    do_map = False
+                    break
+            if do_map:
+                data = open("ntdll.dll", "rb").read()
+                u.mem_map(0x40000000, 0x100000)
+                u.mem_write(0x40000000, data)
+        else:
+            handle = 0x60000000 + len(module_handles) * 0x100000
+            u.mem_map(handle, 0x100000)
+        module_handles[filename] = handle
+    u.reg_write(UC_X86_REG_RAX, handle)
+    if not ex:
+        log(u, "%s(\"%s\") => %#x" % (function_name, filename, handle))
+    else:
+        log(u, "%s(\"%s\", %#x, %#x) => %#x" % (function_name, filename, hFile, dwFlags, handle))
+    error(0)
+
 def LoadLibraryA(machine):
     # HMODULE LoadLibraryA( LPCSTR lpLibFileName );
-    lpLibFileName = machine.cpu.state.rcx
-    strlen(machine)
-    size = machine.cpu.state.rax.value
-    filename = machine.memory.read(lpLibFileName, size).decode()
-    log(machine, "LoadLibraryA(\"%s\") => %#x" % (filename, machine.cpu.state.rax.value))
-    raise NotImplementedError
+    return LoadLibrary(machine, True, False, 0, 0)
 
-def LoadLibraryExW(machine):
+def LoadLibraryExW(u: Uc):
     # HMODULE LoadLibraryExW( LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags );
-    lpLibFileName = machine.cpu.state.rcx
-    hFile = machine.cpu.state.rdx
-    dwFlags = machine.cpu.state.r8
-    wcslen(machine)
-    size = machine.cpu.state.rax.value
-    buffer = machine.memory.read(lpLibFileName, size * 2)
-    filename = buffer.decode("utf-16le")
-    handle = read_int32(buffer[:8:2])
-    machine.cpu.state.rax.value = handle
-    log(machine, "LoadLibraryExW(\"%s\", %#x, %#x) => %#x" % (filename, hFile.value, dwFlags.value, machine.cpu.state.rax.value))
-    error(0)
+    return LoadLibrary(u, False, True, u.reg_read(UC_X86_REG_RDX), u.reg_read(UC_X86_REG_R8))
 
 def TerminateProcess(machine):
     # BOOL TerminateProcess( HANDLE hProcess, UINT uExitCode );
@@ -993,7 +1044,7 @@ def VirtualAlloc(u: Uc):
         res = alloc_memory(free_alloc, dwSize)
         if res is None:
             # add more to the heap
-            enlarge_memory(free_alloc, dwSize)
+            enlarge_memory(u, free_alloc, dwSize)
             res = alloc_memory(free_alloc, dwSize)
     else:
         raise NotImplementedError
@@ -1004,6 +1055,7 @@ def VirtualAlloc(u: Uc):
     if res == 0:
         error(8)
     else:
+        valloc_size[res] = dwSize
         error(0)
 
 def VirtualFree(u: Uc):
@@ -1016,10 +1068,7 @@ def VirtualFree(u: Uc):
     free_alloc = u.__getattribute__("free_alloc")
     size = dwSize
     if dwSize == 0:
-        for start, end, _ in u.mem_regions():
-            if start == lpAddress:
-                size = end - start + 1
-                break
+        size = valloc_size[lpAddress]
     if dwSize != 0:
         dealloc_memory(free_alloc, lpAddress, size)
         res = 1
@@ -1076,10 +1125,10 @@ def WriteFile(u: Uc):
     ))
     error(0)
 
-def GetProcessHeap(machine):
+def GetProcessHeap(u: Uc):
     # HANDLE GetProcessHeap();
-    machine.cpu.state.rax.value = 0x10000000
-    log(machine, "GetProcessHeap() => %#x" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, 0x10000000)
+    log(u, "GetProcessHeap() => %#x" % u.reg_read(UC_X86_REG_RAX))
     error(0)
 
 def HeapCreate(machine):
@@ -1093,31 +1142,48 @@ def HeapCreate(machine):
     ))
     error(0)
 
-def HeapAlloc(machine):
+def HeapAlloc(u: Uc):
     # DECLSPEC_ALLOCATOR LPVOID HeapAlloc( HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes );
-    hHeap = machine.cpu.state.rcx
-    dwFlags = machine.cpu.state.rdx
-    dwBytes = machine.cpu.state.r8
-    if hHeap.value != 0x10000000:
+    hHeap = u.reg_read(UC_X86_REG_RCX)
+    dwFlags = u.reg_read(UC_X86_REG_RDX)
+    dwBytes = u.reg_read(UC_X86_REG_R8)
+    if hHeap != 0x10000000:
         raise NotImplementedError
-    res = machine.memory.alloc(dwBytes.value)
-    if dwFlags.value & 8:
-        machine.memory.write(res, b"\x00" * dwBytes.value)
-    machine.cpu.state.rax.value = res
-    log(machine, "HeapAlloc(%#x, %#x, %d) => %#x" % (hHeap.value, dwFlags.value, dwBytes.value, machine.cpu.state.rax.value))
-    error(0)
+    free_alloc = u.__getattribute__("free_alloc")
+    res = alloc_memory(free_alloc, dwBytes)
+    if res is None:
+        # add more to the heap
+        enlarge_memory(u, free_alloc, dwBytes)
+        res = alloc_memory(free_alloc, dwBytes)
+    if dwFlags & 8:
+        u.mem_write(res, b"\x00" * dwBytes)
+    u.reg_write(UC_X86_REG_RAX, res)
+    log(u, "HeapAlloc(%#x, %#x, %d) => %#x" % (hHeap, dwFlags, dwBytes, u.reg_read(UC_X86_REG_RAX)))
+    if res == 0:
+        error(8)
+    else:
+        valloc_size[res] = dwBytes
+        error(0)
 
-def HeapFree(machine):
+def HeapFree(u: Uc):
     # BOOL HeapFree( HANDLE hHeap, DWORD dwFlags, _Frees_ptr_opt_ LPVOID lpMem );
-    hHeap = machine.cpu.state.rcx
-    dwFlags = machine.cpu.state.rdx
-    lpMem = machine.cpu.state.r8
-    if hHeap.value != 0x10000000:
+    hHeap = u.reg_read(UC_X86_REG_RCX)
+    dwFlags = u.reg_read(UC_X86_REG_RDX)
+    lpMem = u.reg_read(UC_X86_REG_R8)
+    if hHeap != 0x10000000:
         raise NotImplementedError
-    machine.memory.free(lpMem.value)
-    machine.cpu.state.rax.value = 1
-    log(machine, "HeapFree(%#x, %#x, %#x) => %d" % (hHeap.value, dwFlags.value, lpMem.value, machine.cpu.state.rax.value))
-    error(0)
+    free_alloc = u.__getattribute__("free_alloc")
+    size = valloc_size[lpMem]
+    if size != 0:
+        dealloc_memory(free_alloc, lpMem, size)
+        res = 1
+        err = 0
+    else:
+        res = 0
+        err = 6
+    u.reg_write(UC_X86_REG_RAX, res)
+    log(u, "HeapFree(%#x, %#x, %#x) => %d" % (hHeap, dwFlags, lpMem, res))
+    error(err)
 
 def HeapSize(machine):
     # SIZE_T HeapSize( HANDLE hHeap, DWORD dwFlags, LPCVOID lpMem );
@@ -1179,54 +1245,54 @@ def InitializeCriticalSectionAndSpinCount(machine):
     ))
     error(0)
 
-def InitializeCriticalSectionEx(machine):
+def InitializeCriticalSectionEx(u: Uc):
     # BOOL InitializeCriticalSectionEx( LPCRITICAL_SECTION lpCriticalSection, DWORD dwSpinCount, DWORD Flags );
-    lpCriticalSection = machine.cpu.state.rcx
-    dwSpinCount = machine.cpu.state.rdx
-    Flags = machine.cpu.state.r8
-    machine.cpu.state.rax.value = 1
-    log(machine, "InitializeCriticalSectionEx(%#x, %d, %#x) => %d" % (
-        lpCriticalSection.value, dwSpinCount.value, Flags.value, machine.cpu.state.rax.value
+    lpCriticalSection = u.reg_read(UC_X86_REG_RCX)
+    dwSpinCount = u.reg_read(UC_X86_REG_RDX)
+    Flags = u.reg_read(UC_X86_REG_R8)
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "InitializeCriticalSectionEx(%#x, %d, %#x) => %d" % (
+        lpCriticalSection, dwSpinCount, Flags, u.reg_read(UC_X86_REG_RAX)
     ))
     error(0)
 
-def EnterCriticalSection(machine):
+def EnterCriticalSection(u: Uc):
     # void EnterCriticalSection( LPCRITICAL_SECTION lpCriticalSection );
-    lpCriticalSection = machine.cpu.state.rcx
-    log(machine, "EnterCriticalSection(%#x)" % lpCriticalSection.value)
+    lpCriticalSection = u.reg_read(UC_X86_REG_RCX)
+    log(u, "EnterCriticalSection(%#x)" % lpCriticalSection)
 
-def LeaveCriticalSection(machine):
+def LeaveCriticalSection(u: Uc):
     # void LeaveCriticalSection( LPCRITICAL_SECTION lpCriticalSection );
-    lpCriticalSection = machine.cpu.state.rcx
-    log(machine, "LeaveCriticalSection(%#x)" % lpCriticalSection.value)
+    lpCriticalSection = u.reg_read(UC_X86_REG_RCX)
+    log(u, "LeaveCriticalSection(%#x)" % lpCriticalSection)
 
-def FlsAlloc(machine):
+def FlsAlloc(u: Uc):
     # DWORD FlsAlloc( PFLS_CALLBACK_FUNCTION lpCallback );
-    lpCallback = machine.cpu.state.rcx
+    lpCallback = u.reg_read(UC_X86_REG_RCX)
     index = len(fibers[fiber])
     fibers[fiber].append(0)
-    machine.cpu.state.rax.value = index
-    log(machine, "FlsAlloc(%#x) => %d" % (lpCallback.value, machine.cpu.state.rax.value))
+    u.reg_write(UC_X86_REG_RAX, index)
+    log(u, "FlsAlloc(%#x) => %d" % (lpCallback, u.reg_read(UC_X86_REG_RAX)))
 
-def FlsSetValue(machine):
+def FlsSetValue(u: Uc):
     # BOOL FlsSetValue( DWORD dwFlsIndex, PVOID lpFlsData );
-    dwFlsIndex = machine.cpu.state.rcx
-    lpFlsData = machine.cpu.state.rdx
-    fibers[fiber][dwFlsIndex.value] = lpFlsData.value
-    machine.cpu.state.rax.value = 1
-    log(machine, "FlsSetValue(%d, %#x) => %d" % (dwFlsIndex.value, lpFlsData.value, machine.cpu.state.rax.value))
+    dwFlsIndex = u.reg_read(UC_X86_REG_RCX)
+    lpFlsData = u.reg_read(UC_X86_REG_RDX)
+    fibers[fiber][dwFlsIndex] = lpFlsData
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "FlsSetValue(%d, %#x) => %d" % (dwFlsIndex, lpFlsData, u.reg_read(UC_X86_REG_RAX)))
 
-def FlsGetValue(machine):
+def FlsGetValue(u: Uc):
     # PVOID FlsGetValue( DWORD dwFlsIndex );
-    dwFlsIndex = machine.cpu.state.rcx
-    if len(fibers[fiber]) < dwFlsIndex.value:
+    dwFlsIndex = u.reg_read(UC_X86_REG_RCX)
+    if len(fibers[fiber]) < dwFlsIndex:
         res = 0
         error(87)
     else:
-        res = fibers[fiber][dwFlsIndex.value]
+        res = fibers[fiber][dwFlsIndex]
         error(0)
-    machine.cpu.state.rax.value = res
-    log(machine, "FlsGetValue(%d) => %#x" % (dwFlsIndex.value, machine.cpu.state.rax.value))
+    u.reg_write(UC_X86_REG_RAX, res)
+    log(u, "FlsGetValue(%d) => %#x" % (dwFlsIndex, u.reg_read(UC_X86_REG_RAX)))
 
 def TlsAlloc(machine):
     # DWORD TlsAlloc();
@@ -1235,158 +1301,163 @@ def TlsAlloc(machine):
     machine.cpu.state.rax.value = index
     log(machine, "TlsAlloc() => %d" % machine.cpu.state.rax.value)
 
-def GetStartupInfoW(machine):
+def GetStartupInfoW(u: Uc):
     # void GetStartupInfoW( LPSTARTUPINFOW lpStartupInfo );
-    lpStartupInfo = machine.cpu.state.rcx
-    machine.memory.write(lpStartupInfo, pack_int32(96))
-    machine.memory.write(lpStartupInfo + 4, b"\x00" * 92)
-    log(machine, "GetStartupInfoW(%#x)" % lpStartupInfo.value)
+    lpStartupInfo = u.reg_read(UC_X86_REG_RCX)
+    u.mem_write(lpStartupInfo, pack_int32(96))
+    u.mem_write(lpStartupInfo + 4, b"\x00" * 92)
+    log(u, "GetStartupInfoW(%#x)" % lpStartupInfo)
 
-def GetStdHandle(machine):
+def GetStdHandle(u: Uc):
     # HANDLE WINAPI GetStdHandle( _In_ DWORD nStdHandle );
-    nStdHandle = machine.cpu.state.rcx
-    if nStdHandle.value == 4294967286:
+    nStdHandle = u.reg_read(UC_X86_REG_RCX)
+    if nStdHandle == 4294967286:
         name = "stdin"
         handle = 0
-    elif nStdHandle.value == 4294967285:
+    elif nStdHandle == 4294967285:
         name = "stdout"
         handle = 1
-    elif nStdHandle.value == 4294967284:
+    elif nStdHandle == 4294967284:
         name = "stderr"
         handle = 2
     else:
-        log(machine, "GetStdHandle %d" % nStdHandle.value)
+        log(u, "GetStdHandle %d" % nStdHandle)
         raise NotImplementedError
-    machine.cpu.state.rax.value = handle
-    log(machine, "GetStdHandle(\"%s\") => %#x" % (name, machine.cpu.state.rax.value))
+    u.reg_write(UC_X86_REG_RAX, handle)
+    log(u, "GetStdHandle(\"%s\") => %#x" % (name, u.reg_read(UC_X86_REG_RAX)))
     error(0)
 
-def GetFileType(machine):
+def GetFileType(u: Uc):
     # DWORD GetFileType( HANDLE hFile );
-    hFile = machine.cpu.state.rcx
-    if 0 <= hFile.value <= 2:
+    hFile = u.reg_read(UC_X86_REG_RCX)
+    if 0 <= hFile <= 2:
         res = 2
     else:
         raise NotImplementedError
-    machine.cpu.state.rax.value = res
-    log(machine, "GetFileType(%#x) => %d" % (hFile.value, machine.cpu.state.rax.value))
+    u.reg_write(UC_X86_REG_RAX, res)
+    log(u, "GetFileType(%#x) => %d" % (hFile, u.reg_read(UC_X86_REG_RAX)))
     error(0)
 
-def GetCommandLineA(machine):
+def GetCommandLineA(u: Uc):
     # LPSTR GetCommandLineA();
-    machine.cpu.state.rax.value = 0x10100
-    log(machine, "GetCommandLineA() => %#x" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, 0x10100)
+    log(u, "GetCommandLineA() => %#x" % u.reg_read(UC_X86_REG_RAX))
 
-def GetCommandLineW(machine):
+def GetCommandLineW(u: Uc):
     # LPWSTR GetCommandLineW();
-    machine.cpu.state.rax.value = 0x10300
-    log(machine, "GetCommandLineW() => %#x" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, 0x10300)
+    log(u, "GetCommandLineW() => %#x" % u.reg_read(UC_X86_REG_RAX))
 
-def GetEnvironmentStringsW(machine):
+def GetEnvironmentStringsW(u: Uc):
     # LPWCH GetEnvironmentStringsW();
-    machine.cpu.state.rax.value = 0x10500
-    log(machine, "GetEnvironmentStringsW() => %#x" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, 0x10500)
+    log(u, "GetEnvironmentStringsW() => %#x" % u.reg_read(UC_X86_REG_RAX))
 
-def FreeEnvironmentStringsW(machine):
+def FreeEnvironmentStringsW(u: Uc):
     # BOOL FreeEnvironmentStringsW( LPWCH penv );
-    penv = machine.cpu.state.rcx
-    machine.cpu.state.rax.value = 1
-    log(machine, "FreeEnvironmentStringsW(%#x) => %d" % (penv.value, machine.cpu.state.rax.value))
+    penv = u.reg_read(UC_X86_REG_RCX)
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "FreeEnvironmentStringsW(%#x) => %d" % (penv, u.reg_read(UC_X86_REG_RAX)))
     error(0)
 
-def GetLastError(machine):
+def GetLastError(u: Uc):
     # _Post_equals_last_error_ DWORD GetLastError();
-    machine.cpu.state.rax.value = lasterror
-    log(machine, "GetLastError() => %d" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, lasterror)
+    log(u, "GetLastError() => %d" % u.reg_read(UC_X86_REG_RAX))
 
-def SetLastError(machine):
+def SetLastError(u: Uc):
     # void SetLastError( DWORD dwErrCode );
     global lasterror
-    dwErrCode = machine.cpu.state.rcx
-    log(machine, "SetLastError(%d)" % dwErrCode.value)
-    lasterror = dwErrCode.value
+    dwErrCode = u.reg_read(UC_X86_REG_RCX)
+    log(u, "SetLastError(%d)" % dwErrCode)
+    lasterror = dwErrCode
 
-def GetACP(machine):
+def GetACP(u: Uc):
     # UINT GetACP();
-    machine.cpu.state.rax.value = 932
-    log(machine, "GetACP() => %d" % machine.cpu.state.rax.value)
+    u.reg_write(UC_X86_REG_RAX, 932)
+    log(u, "GetACP() => %d" % u.reg_read(UC_X86_REG_RAX))
 
-def GetCPInfo(machine):
+def GetCPInfo(u: Uc):
     # BOOL GetCPInfo( UINT CodePage, LPCPINFO lpCPInfo );
-    CodePage = machine.cpu.state.rcx
-    lpCPInfo = machine.cpu.state.rdx
-    machine.memory.write(lpCPInfo.value + 0x0, pack_int32(2))
-    machine.memory.write(lpCPInfo.value + 0x4, b"\x3f\x00")
-    machine.memory.write(lpCPInfo.value + 0x6, b"\x81\x9f\xe0\xfc\x00\x00\x00\x00\x00\x00\x00\x00")
-    machine.cpu.state.rax.value = 1
-    log(machine, "GetCPInfo(%d, %#x) => %d" % (CodePage.value, lpCPInfo.value, machine.cpu.state.rax.value))
+    CodePage = u.reg_read(UC_X86_REG_RCX)
+    lpCPInfo = u.reg_read(UC_X86_REG_RDX)
+    u.mem_write(lpCPInfo + 0x0, pack_int32(2))
+    u.mem_write(lpCPInfo + 0x4, b"\x3f\x00")
+    u.mem_write(lpCPInfo + 0x6, b"\x81\x9f\xe0\xfc\x00\x00\x00\x00\x00\x00\x00\x00")
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "GetCPInfo(%d, %#x) => %d" % (CodePage, lpCPInfo, u.reg_read(UC_X86_REG_RAX)))
     error(0)
 
-def MultiByteToWideChar(machine):
+def MultiByteToWideChar(u: Uc):
     # int MultiByteToWideChar(
     # UINT CodePage, DWORD dwFlags, _In_NLS_string_(cbMultiByte)LPCCH lpMultiByteStr, int cbMultiByte,
     # LPWSTR lpWideCharStr, int cchWideChar );
-    CodePage = machine.cpu.state.rcx
-    dwFlags = machine.cpu.state.rdx
-    lpMultiByteStr = machine.cpu.state.r8
-    cbMultiByte = machine.cpu.state.r9
-    lpWideCharStr = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
-    cchWideChar = read_int32(machine.memory.read(machine.cpu.state.rsp + 0x30, 4))
+    CodePage = u.reg_read(UC_X86_REG_RCX)
+    dwFlags = u.reg_read(UC_X86_REG_RDX)
+    lpMultiByteStr = u.reg_read(UC_X86_REG_R8)
+    cbMultiByte = u.reg_read(UC_X86_REG_R9)
+    lpWideCharStr = read_stack_param(u, 0)
+    cchWideChar = read_stack_param(u, 1)
     try:
-        "".encode(f"cp{CodePage.value}")
+        "".encode(f"cp{CodePage}")
     except LookupError:
-        print(CodePage.value)
+        print(CodePage)
         raise NotImplementedError
-    buffer = machine.memory.read(lpMultiByteStr, cbMultiByte.value).decode(f"cp{CodePage.value}")
+    buffer = u.mem_read(lpMultiByteStr, cbMultiByte).decode(f"cp{CodePage}")
     res = buffer.encode("utf-16le")
-    if cchWideChar != 0:
-        machine.memory.write(lpWideCharStr, res)
-    machine.cpu.state.rax.value = len(res) // 2
-    log(machine, "MultiByteToWideChar(%d, %#x, \"%s\", %d, %#x, %d) => %d" % (
-        CodePage.value, dwFlags.value, buffer, cbMultiByte.value, lpWideCharStr, cchWideChar,
-        machine.cpu.state.rax.value
+    if cchWideChar != 0 and lpWideCharStr != 0:
+        u.mem_write(lpWideCharStr, res)
+    u.reg_write(UC_X86_REG_RAX, len(res) // 2)
+    log(u, "MultiByteToWideChar(%d, %#x, \"%s\", %d, %#x, %d) => %d" % (
+        CodePage, dwFlags, buffer, cbMultiByte, lpWideCharStr, cchWideChar, u.reg_read(UC_X86_REG_RAX)
     ))
     error(0)
 
-def WideCharToMultiByte(machine):
+def WideCharToMultiByte(u: Uc):
     # int WideCharToMultiByte( UINT CodePage, DWORD dwFlags, _In_NLS_string_(cchWideChar)LPCWCH lpWideCharStr,
     # int cchWideChar, LPSTR lpMultiByteStr, int cbMultiByte, LPCCH lpDefaultChar, LPBOOL lpUsedDefaultChar );
-    CodePage = machine.cpu.state.rcx
-    dwFlags = machine.cpu.state.rdx
-    lpWideCharStr = machine.cpu.state.r8
-    cchWideChar = machine.cpu.state.r9
-    lpMultiByteStr = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
-    cbMultiByte = read_int32(machine.memory.read(machine.cpu.state.rsp + 0x30, 4))
-    lpDefaultChar = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x38, 8))
-    lpUsedDefaultChar = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x40, 8))
-    if CodePage.value == 0:
-        CodePage.value = 932
+    CodePage = u.reg_read(UC_X86_REG_RCX)
+    dwFlags = u.reg_read(UC_X86_REG_RDX)
+    lpWideCharStr = u.reg_read(UC_X86_REG_R8)
+    cchWideChar = u.reg_read(UC_X86_REG_R9)
+    lpMultiByteStr = read_stack_param(u, 0)
+    cbMultiByte = read_stack_param(u, 1)
+    lpDefaultChar = read_stack_param(u, 2)
+    lpUsedDefaultChar = read_stack_param(u, 3)
+    if CodePage == 0:
+        CodePage = 932
     try:
-        "".encode(f"cp{CodePage.value}")
+        "".encode(f"cp{CodePage}")
     except LookupError:
-        print(CodePage.value)
+        print(CodePage)
         raise NotImplementedError
-    buffer = machine.memory.read(lpWideCharStr, cchWideChar.value * 2).decode("utf-16le")
-    res = buffer.encode(f"cp{CodePage.value}")
-    if cbMultiByte != 0:
-        machine.memory.write(lpMultiByteStr, res)
-    machine.cpu.state.rax.value = len(res)
-    log(machine, "WideCharToMultiByte(%d, %#x, \"%s\", %d, %#x, %d, %#x, %d) => %d" % (
-        CodePage.value, dwFlags.value, buffer, cchWideChar.value, lpMultiByteStr, cbMultiByte,
-        lpDefaultChar, lpUsedDefaultChar, machine.cpu.state.rax.value
+    if cchWideChar == 0xffffffff:
+        tmp = u.reg_read(UC_X86_REG_RCX)
+        u.reg_write(UC_X86_REG_RCX, lpWideCharStr)
+        wcslen(u)
+        u.reg_write(UC_X86_REG_RCX, tmp)
+        cchWideChar = u.reg_read(UC_X86_REG_RAX) + 2
+    buffer = u.mem_read(lpWideCharStr, cchWideChar * 2).decode("utf-16le")
+    res = buffer.encode(f"cp{CodePage}")
+    if cbMultiByte != 0 and lpMultiByteStr != 0:
+        u.mem_write(lpMultiByteStr, res)
+    u.reg_write(UC_X86_REG_RAX, len(res))
+    log(u, "WideCharToMultiByte(%d, %#x, \"%s\", %d, %#x, %d, %#x, %d) => %d" % (
+        CodePage, dwFlags, buffer, cchWideChar, lpMultiByteStr, cbMultiByte,
+        lpDefaultChar, lpUsedDefaultChar, u.reg_read(UC_X86_REG_RAX)
     ))
     error(0)
 
-def GetStringTypeW(machine):
+def GetStringTypeW(u: Uc):
     # BOOL GetStringTypeW( DWORD dwInfoType, _In_NLS_string_(cchSrc)LPCWCH lpSrcStr, int cchSrc, LPWORD lpCharType );
-    dwInfoType = machine.cpu.state.rcx
-    lpSrcStr = machine.cpu.state.rdx
-    cchSrc = machine.cpu.state.r8
-    lpCharType = machine.cpu.state.r9
+    dwInfoType = u.reg_read(UC_X86_REG_RCX)
+    lpSrcStr = u.reg_read(UC_X86_REG_RDX)
+    cchSrc = u.reg_read(UC_X86_REG_R8)
+    lpCharType = u.reg_read(UC_X86_REG_R9)
     # breakpoint()
-    machine.cpu.state.rax.value = 0
-    log(machine, "STUB GetStringTypeW(%#x, %#x, %d, %#x) => %d" % (
-        dwInfoType.value, lpSrcStr.value, cchSrc.value, lpCharType.value, machine.cpu.state.rax.value
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "STUB GetStringTypeW(%#x, %#x, %d, %#x) => %d" % (
+        dwInfoType, lpSrcStr, cchSrc, lpCharType, u.reg_read(UC_X86_REG_RAX)
     ))
     error(120)
 
@@ -1405,30 +1476,30 @@ def LCMapStringW(machine):
     ))
     error(120)
 
-def LCMapStringEx(machine):
+def LCMapStringEx(u: Uc):
     # int LCMapStringEx(
     # LPCWSTR lpLocaleName, DWORD dwMapFlags, LPCWSTR lpSrcStr, int cchSrc, LPWSTR lpDestStr, int cchDest,
     # LPNLSVERSIONINFO lpVersionInformation, LPVOID lpReserved, LPARAM sortHandle );
-    lpLocaleName = machine.cpu.state.rcx
-    dwMapFlags = machine.cpu.state.rdx
-    lpSrcStr = machine.cpu.state.r8
-    cchSrc = machine.cpu.state.r9
-    lpDestStr = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x28, 8))
-    cchDest = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x30, 8))
-    lpVersionInformation = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x38, 8))
-    lpReserved = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x40, 8))
-    sortHandle = read_int64(machine.memory.read(machine.cpu.state.rsp + 0x48, 8))
-    machine.cpu.state.rax.value = 0
-    log(machine, "STUB LCMapStringEx(%#x, %#x, %#x, %d, %#x, %d, %#x, %#x, %#x) => %d" % (
-        lpLocaleName.value, dwMapFlags.value, lpSrcStr.value, cchSrc.value, lpDestStr, cchDest, lpVersionInformation,
-        lpReserved, sortHandle, machine.cpu.state.rax.value
+    lpLocaleName = u.reg_read(UC_X86_REG_RCX)
+    dwMapFlags = u.reg_read(UC_X86_REG_RDX)
+    lpSrcStr = u.reg_read(UC_X86_REG_R8)
+    cchSrc = u.reg_read(UC_X86_REG_R9)
+    lpDestStr = read_stack_param(u, 0)
+    cchDest = read_stack_param(u, 1)
+    lpVersionInformation = read_stack_param(u, 2)
+    lpReserved = read_stack_param(u, 3)
+    sortHandle = read_stack_param(u, 4)
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "STUB LCMapStringEx(%#x, %#x, %#x, %d, %#x, %d, %#x, %#x, %#x) => %d" % (
+        lpLocaleName, dwMapFlags, lpSrcStr, cchSrc, lpDestStr, cchDest, lpVersionInformation,
+        lpReserved, sortHandle, u.reg_read(UC_X86_REG_RAX)
     ))
     error(120)
 
-def InitializeSListHead(machine):
+def InitializeSListHead(u: Uc):
     # void InitializeSListHead( PSLIST_HEADER ListHead );
-    ListHead = machine.cpu.state.rcx
-    log(machine, "STUB InitializeSListHead(%#x)" % ListHead.value)
+    ListHead = u.reg_read(UC_X86_REG_RCX)
+    log(u, "STUB InitializeSListHead(%#x)" % ListHead)
 
 def InterlockedPopEntrySList(machine):
     # PSLIST_ENTRY InterlockedPopEntrySList( PSLIST_HEADER ListHead );
@@ -1840,6 +1911,63 @@ def ExitProcess(u: Uc):
     log(u, "ExitProcess(%d)" % uExitCode)
     error(0)
 
+def NtQueryInformationProcess(u: Uc):
+    # NTSTATUS NtQueryInformationProcess( HANDLE ProcessHandle, PROCESSINFOCLASS ProcessInformationClass,
+    # PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength );
+    ProcessHandle = u.reg_read(UC_X86_REG_RCX)
+    ProcessInformationClass = u.reg_read(UC_X86_REG_RDX)
+    ProcessInformation = u.reg_read(UC_X86_REG_R8)
+    ProcessInformationLength = u.reg_read(UC_X86_REG_R9)
+    ReturnLength = read_stack_param(u, 0)
+    if ProcessInformationClass == 7:
+        # ProcessDebugPort
+        if ProcessInformationLength != 8:
+            u.reg_write(UC_X86_REG_RAX, 0xC0000004)
+        else:
+            u.reg_write(UC_X86_REG_RAX, 0)
+            u.mem_write(ProcessInformation, pack_uint64(0))
+            if ReturnLength != 0:
+                u.mem_write(ReturnLength, pack_uint32(8))
+    else:
+        raise NotImplementedError
+    log(u, "NtQueryInformationProcess(%#x, %d, %#x, %d, %#x) => %d" % (
+        ProcessHandle, ProcessInformationClass, ProcessInformation, ProcessInformationLength, ReturnLength,
+        u.reg_read(UC_X86_REG_RAX)
+    ))
+    error(0)
+
+def AreFileApisANSI(u: Uc):
+    # BOOL AreFileApisANSI();
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "AreFileApisANSI() => %d" % u.reg_read(UC_X86_REG_RAX))
+
+def DeleteCriticalSection(u: Uc):
+    # void DeleteCriticalSection( LPCRITICAL_SECTION lpCriticalSection );
+    lpCriticalSection = u.reg_read(UC_X86_REG_RCX)
+    log(u, "DeleteCriticalSection(%#x)" % lpCriticalSection)
+
+def AppPolicyGetProcessTerminationMethod(u: Uc):
+    # LONG AppPolicyGetProcessTerminationMethod( HANDLE processToken, AppPolicyProcessTerminationMethod *pPolicy );
+    processToken = u.reg_read(UC_X86_REG_RCX)
+    pPolicy = u.reg_read(UC_X86_REG_RDX)
+    u.mem_write(pPolicy, pack_uint32(0))
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "AppPolicyGetProcessTerminationMethod(%#x, %#x) => %d" % (
+        processToken, pPolicy, u.reg_read(UC_X86_REG_RAX)
+    ))
+
+def CorExitProcess(u: Uc):
+    # void CorExitProcess( int exitCode );
+    exitCode = u.reg_read(UC_X86_REG_RCX)
+    u.reg_write(UC_X86_REG_RIP, 0)
+    log(u, "CorExitProcess(%d)" % exitCode)
+    error(0)
+
+def FreeLibrary(u: Uc):
+    # BOOL FreeLibrary( HMODULE hLibModule );
+    hLibModule = u.reg_read(UC_X86_REG_RCX)
+    u.reg_write(UC_X86_REG_RAX, 1)
+    log(u, "FreeLibrary(%#x) => %d" % (hLibModule, u.reg_read(UC_X86_REG_RAX)))
 
 # def _initterm(machine):
 #     # ?
@@ -2087,6 +2215,8 @@ api_list = [
     SetUnhandledExceptionFilter,
     GetModuleHandleA,
     GetModuleHandleW,
+    GetModuleHandleExA,
+    GetModuleHandleExW,
     GetProcAddress,
     VirtualProtect,
     GetModuleFileNameW,
@@ -2181,6 +2311,12 @@ api_list = [
     GetNumaHighestNodeNumber,
     HeapSetInformation,
     ExitProcess,
+    NtQueryInformationProcess,
+    AreFileApisANSI,
+    DeleteCriticalSection,
+    AppPolicyGetProcessTerminationMethod,
+    CorExitProcess,
+    FreeLibrary,
     # _initterm,
     # _initterm_e,
     # _onexit,
