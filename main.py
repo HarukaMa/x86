@@ -6,7 +6,7 @@ import time
 
 import capstone
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE, UcError, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_INVALID, \
-    UC_ERR_EXCEPTION, UC_HOOK_INSN, UC_HOOK_MEM_READ, UC_HOOK_MEM_VALID
+    UC_ERR_EXCEPTION, UC_HOOK_INSN, UC_HOOK_MEM_READ, UC_HOOK_MEM_VALID, UC_HOOK_MEM_WRITE
 from unicorn.x86_const import UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RDI, \
     UC_X86_REG_RSI, UC_X86_REG_RBP, UC_X86_REG_RSP, UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_R10, UC_X86_REG_R11, \
     UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15, UC_X86_REG_XMM0, UC_X86_REG_XMM1, UC_X86_REG_XMM2, \
@@ -47,7 +47,7 @@ def rflags_to_str(rflags):
             flags.append(name)
     return ' '.join(flags)
 
-def dump(u: Uc):
+def dump(u: Uc, file: Optional[TextIO] = None):
     rax = u.reg_read(UC_X86_REG_RAX)
     rbx = u.reg_read(UC_X86_REG_RBX)
     rcx = u.reg_read(UC_X86_REG_RCX)
@@ -70,13 +70,22 @@ def dump(u: Uc):
     xmm3 = u.reg_read(UC_X86_REG_XMM3)
     rip = u.reg_read(UC_X86_REG_RIP)
     rflags = u.reg_read(UC_X86_REG_EFLAGS)
-    print("rax: {:#018x}  rbx: {:#018x}  rcx: {:#018x}  rdx: {:#018x}".format(rax, rbx, rcx, rdx))
-    print("rdi: {:#018x}  rsi: {:#018x}  rbp: {:#018x}  rsp: {:#018x}".format(rdi, rsi, rbp, rsp))
-    print("r8 : {:#018x}  r9 : {:#018x}  r10: {:#018x}  r11: {:#018x}".format(r8, r9, r10, r11))
-    print("r12: {:#018x}  r13: {:#018x}  r14: {:#018x}  r15: {:#018x}".format(r12, r13, r14, r15))
-    print("xmm0: {:#034x}          xmm1: {:#034x}".format(xmm0, xmm1))
-    print("xmm2: {:#034x}          xmm3: {:#034x}".format(xmm2, xmm3))
-    print("rip: {:#018x}  rflags: {:s}".format(rip, rflags_to_str(rflags)))
+    if file:
+        file.write("rax: {:#018x}  rbx: {:#018x}  rcx: {:#018x}  rdx: {:#018x}\n".format(rax, rbx, rcx, rdx))
+        file.write("rdi: {:#018x}  rsi: {:#018x}  rbp: {:#018x}  rsp: {:#018x}\n".format(rdi, rsi, rbp, rsp))
+        file.write("r8 : {:#018x}  r9 : {:#018x}  r10: {:#018x}  r11: {:#018x}\n".format(r8, r9, r10, r11))
+        file.write("r12: {:#018x}  r13: {:#018x}  r14: {:#018x}  r15: {:#018x}\n".format(r12, r13, r14, r15))
+        file.write("xmm0: {:#034x}          xmm1: {:#034x}\n".format(xmm0, xmm1))
+        file.write("xmm2: {:#034x}          xmm3: {:#034x}\n".format(xmm2, xmm3))
+        file.write("rip: {:#018x}  rflags: {:s}\n".format(rip, rflags_to_str(rflags)))
+    else:
+        print("rax: {:#018x}  rbx: {:#018x}  rcx: {:#018x}  rdx: {:#018x}".format(rax, rbx, rcx, rdx))
+        print("rdi: {:#018x}  rsi: {:#018x}  rbp: {:#018x}  rsp: {:#018x}".format(rdi, rsi, rbp, rsp))
+        print("r8 : {:#018x}  r9 : {:#018x}  r10: {:#018x}  r11: {:#018x}".format(r8, r9, r10, r11))
+        print("r12: {:#018x}  r13: {:#018x}  r14: {:#018x}  r15: {:#018x}".format(r12, r13, r14, r15))
+        print("xmm0: {:#034x}          xmm1: {:#034x}".format(xmm0, xmm1))
+        print("xmm2: {:#034x}          xmm3: {:#034x}".format(xmm2, xmm3))
+        print("rip: {:#018x}  rflags: {:s}".format(rip, rflags_to_str(rflags)))
 
 def main():
     # noinspection PyArgumentEqualDefault
@@ -84,7 +93,7 @@ def main():
     load_pe64_u(u, sys.argv[1])
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     debug_start: Optional[int] = None
-    trace_start: Optional[int] = None
+    trace_start: Optional[int] = 41034900
     machine = Machine(debug_start=debug_start, trace_start=trace_start)
     load_pe64(machine, sys.argv[1])
     # load_pe32(machine, "/Users/MrX/Downloads/chuniApp_c+_origin.exe")
@@ -123,6 +132,7 @@ def main():
                 if debug:
                     print("%d\t%#x  %s %s" % (inst_count, inst.address, inst.mnemonic, inst.op_str))
                 if trace:
+                    dump(uc, trace_file)
                     trace_file.write("%d\t%#x  %s %s\n" % (inst_count, inst.address, inst.mnemonic, inst.op_str))
             except:
                 if data[0] == 0x06:
@@ -136,6 +146,7 @@ def main():
                 if debug:
                     print(s % (address, i))
                 if trace:
+                    dump(uc, trace_file)
                     trace_file.write(f"{s}\n" % (address, i))
 
         if data[0] in (0x06, 0x07):
@@ -239,6 +250,12 @@ def main():
         print(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} ntdll {access} {address:#x} {size} {value}")
         return True
     u.hook_add(UC_HOOK_MEM_VALID, n, begin=0x40000000, end=0x40100000)
+    def e(_, access, address, size, value, __):
+        if trace_file:
+            trace_file.write(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} mem_self {access} {address:#x} {size} {value:#x}\n")
+        print(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} mem {access} {address:#x} {size} {value:#x}")
+        return True
+    u.hook_add(UC_HOOK_MEM_VALID, e, begin=0x12fed0, end=0x12fed0)
     def c(_, __):
         print(f"syscall {address:#x}")
         return True

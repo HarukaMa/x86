@@ -1,7 +1,7 @@
 from io import SEEK_CUR, SEEK_SET
 from typing import Union
 
-from unicorn import Uc, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE
+from unicorn import Uc, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC
 from unicorn.x86_const import UC_X86_REG_RIP, UC_X86_REG_RSP
 
 from machine import Machine
@@ -262,12 +262,13 @@ def load_pe64_u(u: Uc, file: str, arguments=None):
     u.__setattr__("free_alloc", [(0x10000000, heap_reserve)])
     u.__setattr__("free_map", [(0x30000000, 0x10000000)])
 
-    u.mem_map(0x0, 0x10000, UC_PROT_READ | UC_PROT_WRITE) # TEB]
+    u.mem_map(0x0, 0x10000, UC_PROT_READ | UC_PROT_WRITE) # TEB
     u.mem_write(0x8, pack_uint64(0x130000))
     u.mem_write(0x10, pack_uint64(0x12d000))
     u.mem_write(0x38, pack_uint64(0x8100))
     u.mem_write(0x40, pack_uint64(0x8000))
     u.mem_write(0x60, pack_uint64(0x2000))
+    u.mem_write(0x2002, pack_uint8(0))
     u.mem_write(0x8000, pack_uint16(0x100))
     # debug port
     u.mem_write(0x8100, pack_uint32(0))
@@ -280,18 +281,24 @@ def load_pe64_u(u: Uc, file: str, arguments=None):
         va = read_int32(exe.read(4))
         size = read_int32(exe.read(4))
         ptr = read_int32(exe.read(4))
+        exe.seek(12, SEEK_CUR)
+        char = read_int32(exe.read(4))
+        prot = 0
+        if char & 0x20000000:
+            prot |= UC_PROT_EXEC
+        if char & 0x40000000:
+            prot |= UC_PROT_READ
+        if char & 0x80000000:
+            prot |= UC_PROT_WRITE
         if size == ptr == 0:
-            exe.seek(12, SEEK_CUR)
-            char = read_int32(exe.read(4))
             if char & 0x00000080:
-                u.mem_map(base + va, uninit_size)
+                u.mem_map(base + va, uninit_size, prot)
         else:
-            u.mem_map(base + va, virtual_size)
+            u.mem_map(base + va, virtual_size, prot)
             pos = exe.tell()
             exe.seek(ptr, SEEK_SET)
             u.mem_write(base + va, exe.read(size))
             exe.seek(pos, SEEK_SET)
-            exe.seek(16, SEEK_CUR)
     u.__setattr__("base", base)
     u.__setattr__("bases",{
         file.split("/")[-1]: base

@@ -1069,7 +1069,7 @@ def VirtualFree(u: Uc):
     size = dwSize
     if dwSize == 0:
         size = valloc_size[lpAddress]
-    if dwSize != 0:
+    if size != 0:
         dealloc_memory(free_alloc, lpAddress, size)
         res = 1
         err = 0
@@ -1968,6 +1968,17 @@ def FreeLibrary(u: Uc):
     hLibModule = u.reg_read(UC_X86_REG_RCX)
     u.reg_write(UC_X86_REG_RAX, 1)
     log(u, "FreeLibrary(%#x) => %d" % (hLibModule, u.reg_read(UC_X86_REG_RAX)))
+
+def RtlAdjustPrivilege(u: Uc):
+    # NTSTATUS RtlAdjustPrivilege( ULONG Privilege, BOOLEAN Enable, BOOLEAN Client, PBOOLEAN WasEnabled );
+    Privilege = u.reg_read(UC_X86_REG_RCX)
+    Enable = u.reg_read(UC_X86_REG_RDX)
+    Client = u.reg_read(UC_X86_REG_R8)
+    WasEnabled = u.reg_read(UC_X86_REG_R9)
+    u.reg_write(UC_X86_REG_RAX, 0)
+    log(u, "RtlAdjustPrivilege(%d, %d, %d, %#x) => %d" % (
+        Privilege, Enable, Client, WasEnabled, u.reg_read(UC_X86_REG_RAX)
+    ))
 
 # def _initterm(machine):
 #     # ?
