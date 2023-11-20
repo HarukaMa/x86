@@ -6,18 +6,19 @@ import time
 
 import capstone
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE, UcError, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_INVALID, \
-    UC_ERR_EXCEPTION, UC_HOOK_INSN, UC_HOOK_MEM_READ, UC_HOOK_MEM_VALID, UC_HOOK_MEM_WRITE
+    UC_ERR_EXCEPTION, UC_HOOK_INSN, UC_HOOK_MEM_READ, UC_HOOK_MEM_VALID, UC_HOOK_MEM_WRITE, UC_HOOK_INTR
 from unicorn.x86_const import UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RDI, \
     UC_X86_REG_RSI, UC_X86_REG_RBP, UC_X86_REG_RSP, UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_R10, UC_X86_REG_R11, \
     UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15, UC_X86_REG_XMM0, UC_X86_REG_XMM1, UC_X86_REG_XMM2, \
-    UC_X86_REG_XMM3, UC_X86_REG_RIP, UC_X86_REG_EFLAGS, UC_X86_REG_RFLAGS, UC_X86_INS_SYSCALL
+    UC_X86_REG_XMM3, UC_X86_REG_RIP, UC_X86_REG_EFLAGS, UC_X86_REG_RFLAGS, UC_X86_INS_SYSCALL, UC_X86_INS_IN, \
+    UC_X86_INS_OUT
 
 from exc import Exited
 from imports import api_list
 from machine import Machine
 from loader import load_pe64, load_pe32, load_pe64_u
 
-from utils import read_int32, read_int64, read_uint64, pack_uint64, read_uint32, read_uint8
+from utils import read_int32, read_int64, read_uint64, pack_uint64, read_uint32, read_uint8, pack_uint32
 
 
 def rflags_to_str(rflags):
@@ -93,7 +94,7 @@ def main():
     load_pe64_u(u, sys.argv[1])
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     debug_start: Optional[int] = None
-    trace_start: Optional[int] = 41034900
+    trace_start: Optional[int] = None
     machine = Machine(debug_start=debug_start, trace_start=trace_start)
     load_pe64(machine, sys.argv[1])
     # load_pe32(machine, "/Users/MrX/Downloads/chuniApp_c+_origin.exe")
@@ -171,7 +172,7 @@ def main():
         inst_count += 1
 
     def push_context():
-        context = u.reg_read(UC_X86_REG_RSP) - 0x708
+        context = u.reg_read(UC_X86_REG_RSP) - 0x700
         u.mem_write(context + 0x44, pack_uint64(u.reg_read(UC_X86_REG_RFLAGS)))
         u.mem_write(context + 0x78, pack_uint64(u.reg_read(UC_X86_REG_RAX)))
         u.mem_write(context + 0x80, pack_uint64(u.reg_read(UC_X86_REG_RCX)))
@@ -185,14 +186,14 @@ def main():
         u.mem_write(context + 0xc0, pack_uint64(u.reg_read(UC_X86_REG_R9)))
         u.mem_write(context + 0xc8, pack_uint64(u.reg_read(UC_X86_REG_R10)))
         u.mem_write(context + 0xd0, pack_uint64(u.reg_read(UC_X86_REG_R11)))
-        u.mem_write(context + 0xd8, pack_uint64(u.reg_read(UC_X86_REG_R12)))
         u.mem_write(context + 0xe0, pack_uint64(u.reg_read(UC_X86_REG_R13)))
         u.mem_write(context + 0xe8, pack_uint64(u.reg_read(UC_X86_REG_R14)))
         u.mem_write(context + 0xf0, pack_uint64(u.reg_read(UC_X86_REG_R15)))
         u.mem_write(context + 0xf8, pack_uint64(u.reg_read(UC_X86_REG_RIP)))
-        # should save xmm0 as well but skip for now
+        record = u.reg_read(UC_X86_REG_RSP) - 0x500 # EXCEPTION_RECORD
+        u.mem_write(record, pack_uint32(0xc0000096))
         u.reg_write(UC_X86_REG_RSP, u.reg_read(UC_X86_REG_RSP) - 0xe20)
-        u.reg_write(UC_X86_REG_RCX, 0xffffffffffff)
+        u.reg_write(UC_X86_REG_RCX, record)
         u.reg_write(UC_X86_REG_RDX, 0xffffffffffff)
         u.reg_write(UC_X86_REG_R8, context)
         u.reg_write(UC_X86_REG_R9, 0xffffffffffff)
@@ -216,8 +217,26 @@ def main():
                 return handler
         return None
 
+    def handle_exception() -> bool:
+        handler_address = find_handler()
+        if handler_address:
+            rflags = u.reg_read(UC_X86_REG_RFLAGS)
+            if rflags & (1 << 8):
+                # remove TF
+                rflags &= ~(1 << 8)
+            u.reg_write(UC_X86_REG_RFLAGS, rflags)
+            push_context()
+            u.reg_write(UC_X86_REG_RIP, handler_address)
+            u.emu_start(u.reg_read(UC_X86_REG_RIP), 0xe8ce)
+            load_context()
+            return True
+        else:
+            return False
+
+
+
     def load_context():
-        context = u.reg_read(UC_X86_REG_RSP) + 0x710
+        context = u.reg_read(UC_X86_REG_RSP) + 0x718
         u.reg_write(UC_X86_REG_RFLAGS, read_uint64(u.mem_read(context + 0x44, 8)))
         u.reg_write(UC_X86_REG_RAX, read_uint64(u.mem_read(context + 0x78, 8)))
         u.reg_write(UC_X86_REG_RCX, read_uint64(u.mem_read(context + 0x80, 8)))
@@ -252,38 +271,22 @@ def main():
     u.hook_add(UC_HOOK_MEM_VALID, n, begin=0x40000000, end=0x40100000)
     def e(_, access, address, size, value, __):
         if trace_file:
-            trace_file.write(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} mem_self {access} {address:#x} {size} {value:#x}\n")
+            trace_file.write(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} mem {access} {address:#x} {size} {value:#x}\n")
         print(f"{u.__getattribute__('inst_count')} {u.reg_read(UC_X86_REG_RIP):#x} mem {access} {address:#x} {size} {value:#x}")
         return True
-    u.hook_add(UC_HOOK_MEM_VALID, e, begin=0x12fed0, end=0x12fed0)
-    def c(_, __):
-        print(f"syscall {address:#x}")
-        return True
-    u.hook_add(UC_HOOK_INSN, c, arg1=UC_X86_INS_SYSCALL)
+    # u.hook_add(UC_HOOK_MEM_VALID, e, begin=0x12fed0, end=0x12fed0)
+    def p(_, __, ___, ____):
+        print("priv_instruction")
+        return handle_exception()
+    u.hook_add(UC_HOOK_INSN, p, arg1=UC_X86_INS_IN)
+    u.hook_add(UC_HOOK_INSN, p, arg1=UC_X86_INS_OUT)
     while True:
         try:
             u.emu_start(u.reg_read(UC_X86_REG_RIP), 0)
             if u.reg_read(UC_X86_REG_RIP) == 0:
                 break
         except UcError as e:
-            handler_address = find_handler()
-            if handler_address:
-                rflags = u.reg_read(UC_X86_REG_RFLAGS)
-                if e.errno == UC_ERR_EXCEPTION:
-                    if rflags & (1 << 8):
-                        print("Exception #DB thrown")
-                        # remove TF
-                        rflags &= ~(1 << 8)
-                    else:
-                        print("Unknown exception thrown")
-                else:
-                    print("Unknown exception thrown")
-                u.reg_write(UC_X86_REG_RFLAGS, rflags)
-                push_context()
-                u.reg_write(UC_X86_REG_RIP, handler_address)
-                u.emu_start(u.reg_read(UC_X86_REG_RIP), 0xe8ce)
-                load_context()
-            else:
+            if not handle_exception():
                 dump(u)
                 address = u.reg_read(UC_X86_REG_RIP)
                 data = u.mem_read(address, 256)
