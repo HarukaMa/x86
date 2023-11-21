@@ -439,6 +439,13 @@ def CreateFile(u: Uc, a: bool):
         filename = u.mem_read(lpFileName, size).decode()
     else:
         filename = u.mem_read(lpFileName, size * 2).decode("utf-16le")
+
+    if os.name == "nt":
+        temp_path = "c:\\temp\\"
+    else:
+        temp_path = "/tmp/"
+        filename = filename.replace("\\", "/")
+
     if dwFlagsAndAttributes & 0x2000000:
         # try dir
         if os.path.exists(filename):
@@ -455,7 +462,7 @@ def CreateFile(u: Uc, a: bool):
     handle = next_file_handle + 0x10000
 
     if "\\\\.\\" in filename:
-        fs_filename = filename.replace("\\\\.\\", "c:\\temp\\")
+        fs_filename = filename.replace("\\\\.\\", temp_path)
     else:
         fs_filename = filename
     mode = ""
@@ -846,11 +853,15 @@ def GetTempPathW(u: Uc):
     # DWORD GetTempPathW( DWORD nBufferLength, LPWSTR lpBuffer );
     nBufferLength = u.reg_read(UC_X86_REG_RCX)
     lpBuffer = u.reg_read(UC_X86_REG_RDX)
-    filename = "c:\\temp\\".encode("utf-16le")
+    if os.name == "nt":
+        temp_path = "c:\\temp\\"
+    else:
+        temp_path = "/tmp/"
+    filename = temp_path.encode("utf-16le")
     u.mem_write(lpBuffer, filename + b"\x00\x00")
     u.reg_write(UC_X86_REG_RAX, 8)
     log(u, "GetTempPathW(%d, %#x) => %d (\"%s\")" % (
-        nBufferLength, lpBuffer, 8, "c:\\temp\\"
+        nBufferLength, lpBuffer, 8, temp_path
     ))
     error(0)
 
